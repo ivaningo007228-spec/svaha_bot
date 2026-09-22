@@ -902,6 +902,7 @@ class AccountBot:
 
         self._stop_event: asyncio.Event = asyncio.Event()
         self.resurrector_task: asyncio.Task | None = None
+        self.night_mode_active: bool = False
 
         self._register_handlers()
 
@@ -955,6 +956,37 @@ class AccountBot:
     def is_ai_frozen(self) -> bool:
         """Проверить, заморожен ли ИИ (выключен вручную или активен режим сна)."""
         return (not self.bot_active) or self.is_bot_asleep()
+
+    def is_night_time(self) -> bool:
+        """
+        Проверка системного времени: попадает ли оно в ночной диапазон с 21:00 вечера до 09:00 утра.
+        В этот промежуток юзерботу категорически запрещено писать первым и инициировать диалог.
+        """
+        curr_time = datetime.now().time()
+        return curr_time >= dtime(21, 0) or curr_time < dtime(9, 0)
+
+    def check_and_update_night_mode(self, context: str = "Регулярная проверка") -> bool:
+        """
+        Мгновенно проверяет текущее время, обновляет флаг self.night_mode_active и логирует статус.
+        Возвращает True, если ночной режим активен (инициация диалогов запрещена).
+        """
+        is_night = self.is_night_time()
+        self.night_mode_active = is_night
+        time_str = datetime.now().time().strftime("%H:%M:%S")
+
+        if is_night:
+            log.info(
+                "[%s][RESURRECTOR][%s] Ночной режим АКТИВЕН (время: %s, диапазон: 21:00–09:00). "
+                "Флаг запрета инициации диалогов выставлен (сон).",
+                self.name, context, time_str
+            )
+        else:
+            log.info(
+                "[%s][RESURRECTOR][%s] Дневной режим АКТИВЕН (время: %s, рабочий диапазон: 09:00–21:00). "
+                "Инициация диалогов и пинг молчащих чатов РАЗРЕШЕНЫ.",
+                self.name, context, time_str
+            )
+        return is_night
 
     def activate_sleep_mode(self) -> None:
         """Заморозить ИИ для этого аккаунта на SLEEP_AFTER_MY_MSG_MINUTES минут."""
@@ -2354,9 +2386,17 @@ class AccountBot:
                     extra=f"Мэтч из Дайвинчика (@{target_username})" if target_username else "Мэтч из Дайвинчика",
                 )
 
-                # Запускаем отложенное приветствие в фоновом режиме (через 90 секунд)
-                log.info("[%s][LEOBOT] Запуск фонового таймера приветствия (90 с) для %s (%d)...", self.name, name, target_user_id)
-                asyncio.create_task(self._delayed_greeting(target_user_id, name, display_id))
+                # Проверяем ночной режим перед планированием приветствия
+                if self.is_night_time() or self.night_mode_active:
+                    log.info(
+                        "[%s][LEOBOT] Мэтч %s (%d) зафиксирован в базе, но сейчас ночное время (21:00–09:00). "
+                        "Приветствие не отправляется.",
+                        self.name, name, target_user_id
+                    )
+                else:
+                    # Запускаем отложенное приветствие в фоновом режиме (через 90 секунд)
+                    log.info("[%s][LEOBOT] Запуск фонового таймера приветствия (90 с) для %s (%d)...", self.name, name, target_user_id)
+                    asyncio.create_task(self._delayed_greeting(target_user_id, name, display_id))
                 return
             else:
                 log.warning("[%s][LEOBOT] Не удалось определить ID клиента из сообщения leomatchbot: '%s'", self.name, text[:80])
@@ -2373,6 +2413,15 @@ class AccountBot:
         try:
             log.info("[%s][GREETING] Старт ожидания 90 сек перед приветствием для %s (%s)...", self.name, name, display_id)
             await asyncio.sleep(90)
+
+            # Проверка ночного режима: если наступило ночное время (21:00–09:00), запрещено писать первым
+            if self.is_night_time() or self.night_mode_active:
+                log.info(
+                    "[%s][GREETING] Активен ночной режим (время: %s, диапазон: 21:00–09:00). "
+                    "Отмена отправки приветствия клиенту %d, чтобы не будить человека ночью.",
+                    self.name, datetime.now().time().strftime("%H:%M:%S"), target_user_id
+                )
+                return
 
             # Проверяем: если девушка уже написала первой за эти 90 секунд, не шлем приветствие повторно
             chat_data = self.active_chats.get(target_user_id) or self.active_chats.get(str(target_user_id), {})
@@ -2532,104 +2581,166 @@ class AccountBot:
     # ── Фоновые задачи аккаунта ─────────────────────────────────────────────
 
     async def conversation_resurrector(self) -> None:
-        """Каждые 15 минут проверяем молчащие чаты и шлём 'пинг'."""
-        log.info("[%s] Фоновая задача реанимации диалогов (conversation_resurrector) запущена", self.name)
+        """
+        Фоновый планировщик контроля ночного режима и реанимации молчащих диалогов:
+        1. Мгновенная проверка при старте: немедленно проверяет системное время компьютера.
+           Если текущее время в диапазоне с 21:00 до 09:00, бот сразу выставляет флаг
+           запрета инициации диалогов (self.night_mode_active = True), логирует статус
+           и уходит в сон.
+        2. Ежечасный цикл проверки: просыпается ровно раз в 3600 секунд (await asyncio.sleep(3600)),
+           проверяет время и обновляет статус (активен сон или можно писать).
+        3. Безопасность event loop: работает как независимая фоновая задача asyncio.create_task,
+           не блокируется обработчиками сообщений или тяжелым инференсом Qwen.
+        """
+        log.info("[%s][RESURRECTOR] Фоновая задача контроля ночного режима и реанимации диалогов запущена", self.name)
+
+        # Шаг 1. Мгновенная проверка при старте (без ожидания первого таймера)
+        is_night = self.check_and_update_night_mode(context="Мгновенная проверка при старте")
+        if is_night:
+            log.info(
+                "[%s][RESURRECTOR] Старт пришелся на ночное время (21:00–09:00). Флаг запрета инициации диалогов выставлен. Уход в сон на 1 час (3600 с)...",
+                self.name
+            )
+        else:
+            # Дневное время — первичная проверка замолчавших чатов
+            if not self.is_ai_frozen():
+                log.info("[%s][RESURRECTOR] Старт в дневное время (09:00–21:00). Первичный опрос молчащих чатов...", self.name)
+                try:
+                    await self._resurrect_silent_chats()
+                except Exception as exc:
+                    log.error("[%s][RESURRECTOR] Ошибка первичного опроса чатов: %s", self.name, exc)
+            else:
+                log.info("[%s][RESURRECTOR] ИИ заморожен при старте — первичный опрос молчащих чатов пропущен", self.name)
+
+        # Шаг 2. Строгий ежечасный цикл проверки (ровно 3600 секунд)
+        CHECK_INTERVAL_SECONDS = 3600
+
         while not self._stop_event.is_set():
             try:
-                await asyncio.sleep(15 * 60)
+                # Ожидание 3600 секунд (с поддержкой мгновенной реакции на остановку бота)
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=CHECK_INTERVAL_SECONDS)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+                if self._stop_event.is_set():
+                    break
+
+                # Ежечасная проверка времени и обновление статуса
+                is_night = self.check_and_update_night_mode(context="Ежечасный цикл проверки")
+
+                if is_night:
+                    log.info(
+                        "[%s][RESURRECTOR] Ночной статус подтвержден. Инициация диалогов запрещена. Следующая проверка через 3600 с.",
+                        self.name
+                    )
+                    continue
+
                 if self.is_ai_frozen():
-                    continue
-
-                # Жесткая проверка ночного режима: с 21:00 вечера до 09:00 утра
-                # боту КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО писать первым и инициировать диалог
-                current_time = datetime.now().time()
-                if current_time >= dtime(21, 0) or current_time < dtime(9, 0):
                     log.info(
-                        "[%s][RESURRECTOR] Ночной режим активен (текущее время: %s, диапазон: 21:00–09:00). "
-                        "Инициация диалогов и пинг чатов категорически запрещены. Задача спит.",
-                        self.name,
-                        current_time.strftime("%H:%M:%S"),
+                        "[%s][RESURRECTOR] Дневное время активно, но ИИ заморожен (выключен или режим сна). Пропуск пинга.",
+                        self.name
                     )
                     continue
 
-                now = datetime.now()
-                for user_id, chat_data in list(self.active_chats.items()):
-                    # Пропускаем строковые ключи-дубликаты при переборе
-                    if isinstance(user_id, str):
-                        continue
+                log.info("[%s][RESURRECTOR] Дневное время активно. Запуск плановой проверки замолчавших диалогов...", self.name)
+                await self._resurrect_silent_chats()
 
-                    # Проверяем ночной режим на каждой итерации перебора чатов
-                    curr_time = datetime.now().time()
-                    if curr_time >= dtime(21, 0) or curr_time < dtime(9, 0):
-                        log.info(
-                            "[%s][RESURRECTOR] Наступило ночное время (%s). Прерываем пинг чатов.",
-                            self.name,
-                            curr_time.strftime("%H:%M:%S"),
-                        )
-                        break
+            except asyncio.CancelledError:
+                log.debug("[%s][RESURRECTOR] Фоновая задача conversation_resurrector остановлена", self.name)
+                break
+            except Exception as exc:
+                log.error("[%s][RESURRECTOR] Непредвиденная ошибка в conversation_resurrector: %s", self.name, exc, exc_info=True)
+                try:
+                    await asyncio.sleep(5)
+                except (asyncio.CancelledError, Exception):
+                    break
 
-                    if chat_data.get("pinged"):
-                        continue
-                    if chat_data.get("last_msg_is_me"):
-                        continue
+    async def _resurrect_silent_chats(self) -> None:
+        """Обход активных чатов и отправка ненавязчивого пинга, если собеседник долго молчит."""
+        if self.is_night_time() or self.night_mode_active or self.is_ai_frozen():
+            log.info("[%s][RESURRECTOR] Проверка чатов отменена: активен ночной режим или ИИ заморожен", self.name)
+            return
 
-                    last_time = chat_data.get("last_msg_time")
-                    if not last_time:
-                        continue
+        now = datetime.now()
+        for user_id, chat_data in list(self.active_chats.items()):
+            # Пропускаем строковые ключи-дубликаты при переборе
+            if isinstance(user_id, str):
+                continue
 
-                    threshold_h = random.uniform(PING_MIN_HOURS, PING_MAX_HOURS)
-                    if isinstance(last_time, (int, float)):
-                        elapsed_h = (asyncio.get_event_loop().time() - last_time) / 3600
-                    else:
-                        elapsed_h = (now - last_time).total_seconds() / 3600
+            # Проверяем ночной режим на каждой итерации перебора чатов
+            if self.is_night_time() or self.night_mode_active:
+                log.info(
+                    "[%s][RESURRECTOR] Наступило ночное время (%s). Прерываем пинг чатов.",
+                    self.name,
+                    datetime.now().time().strftime("%H:%M:%S"),
+                )
+                self.night_mode_active = True
+                break
 
-                    if elapsed_h < threshold_h:
-                        continue
+            if chat_data.get("pinged"):
+                continue
+            if chat_data.get("last_msg_is_me"):
+                continue
 
-                    log.info(
-                        "[%s][RESURRECTOR] Пинг чата %s — тишина %.1f ч (порог %.1f ч)",
-                        self.name, user_id, elapsed_h, threshold_h
-                    )
+            last_time = chat_data.get("last_msg_time")
+            if not last_time:
+                continue
 
-                    client_row = await self.excel_read_client(user_id)
-                    hobby_hint = ""
-                    if client_row and client_row.get("Увлечения/Хобби"):
-                        hobby_hint = (
-                            f"У клиента есть хобби: {client_row['Увлечения/Хобби']}. "
-                            "Можешь упомянуть его, чтобы пинг звучал естественнее. "
-                        )
+            threshold_h = random.uniform(PING_MIN_HOURS, PING_MAX_HOURS)
+            if isinstance(last_time, (int, float)):
+                elapsed_h = (asyncio.get_event_loop().time() - last_time) / 3600
+            else:
+                elapsed_h = (now - last_time).total_seconds() / 3600
 
-                    ping_prompt = (
-                        f"Диалог прервался примерно на {elapsed_h:.1f} ч. "
-                        f"{hobby_hint}"
-                        "Напиши короткое, ненавязчивое сообщение в одно предложение, "
-                        "чтобы возобновить беседу или узнать как дела."
-                    )
+            if elapsed_h < threshold_h:
+                continue
 
-                    try:
-                        log.info("[%s][RESURRECTOR] Пинг чата %s: запрос фразы к ИИ...", self.name, user_id)
-                        raw_reply = await self.ask_ai(user_id, ping_prompt)
-                        if raw_reply:
-                            clean = raw_reply.replace(MARKER_INVITATION, "").replace(INVITE_MARKER, "")
-                            clean = re.sub(r"ОБНОВИТЬ_ДАННЫЕ:.*", "", clean).strip()
-                            clean = re.sub(r"<think>[\s\S]*?</think>", "", clean).strip()
-                            clean = re.sub(r"\s*\){2,}$", "", clean).strip()
-                            if clean:
-                                # Имитируем набор текста перед отправкой пинга
-                                try:
-                                    await self.client.send_chat_action(user_id, enums.ChatAction.TYPING)
-                                except Exception:
-                                    pass
-                                await asyncio.sleep(random.uniform(2.0, 4.0))
+            log.info(
+                "[%s][RESURRECTOR] Пинг чата %s — тишина %.1f ч (порог %.1f ч)",
+                self.name, user_id, elapsed_h, threshold_h
+            )
 
-                                log.info("[%s][RESURRECTOR] Пинг чата %s: отправка сообщения '%s'...", self.name, user_id, clean[:50])
-                                await self.client.send_message(user_id, clean)
-                                chat_data["pinged"] = True
-                                self._update_chat_state(user_id, is_me=True)
-                                self._append_to_history(user_id, "assistant", clean)
-                                log.info("[%s][RESURRECTOR] Пинг успешно отправлен клиенту %s", self.name, user_id)
-                    except Exception as exc:
-                        log.error("[%s][RESURRECTOR] Ошибка отправки пинга клиенту %s: %s", self.name, user_id, exc)
+            client_row = await self.excel_read_client(user_id)
+            hobby_hint = ""
+            if client_row and client_row.get("Увлечения/Хобби"):
+                hobby_hint = (
+                    f"У клиента есть хобби: {client_row['Увлечения/Хобби']}. "
+                    "Можешь упомянуть его, чтобы пинг звучал естественнее. "
+                )
+
+            ping_prompt = (
+                f"Диалог прервался примерно на {elapsed_h:.1f} ч. "
+                f"{hobby_hint}"
+                "Напиши короткое, ненавязчивое сообщение в одно предложение, "
+                "чтобы возобновить беседу или узнать как дела."
+            )
+
+            try:
+                log.info("[%s][RESURRECTOR] Пинг чата %s: запрос фразы к ИИ...", self.name, user_id)
+                raw_reply = await self.ask_ai(user_id, ping_prompt)
+                if raw_reply:
+                    clean = raw_reply.replace(MARKER_INVITATION, "").replace(INVITE_MARKER, "")
+                    clean = re.sub(r"ОБНОВИТЬ_ДАННЫЕ:.*", "", clean).strip()
+                    clean = re.sub(r"<think>[\s\S]*?</think>", "", clean).strip()
+                    clean = re.sub(r"\s*\){2,}$", "", clean).strip()
+                    if clean:
+                        # Имитируем набор текста перед отправкой пинга
+                        try:
+                            await self.client.send_chat_action(user_id, enums.ChatAction.TYPING)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(random.uniform(2.0, 4.0))
+
+                        log.info("[%s][RESURRECTOR] Пинг чата %s: отправка сообщения '%s'...", self.name, user_id, clean[:50])
+                        await self.client.send_message(user_id, clean)
+                        chat_data["pinged"] = True
+                        self._update_chat_state(user_id, is_me=True)
+                        self._append_to_history(user_id, "assistant", clean)
+                        log.info("[%s][RESURRECTOR] Пинг успешно отправлен клиенту %s", self.name, user_id)
+            except Exception as exc:
+                log.error("[%s][RESURRECTOR] Ошибка отправки пинга клиенту %s: %s", self.name, user_id, exc)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -2859,6 +2970,9 @@ class AccountBot:
         username = self.client.me.username if self.client.me and self.client.me.username else "??"
         log.info("[%s] Аккаунт успешно авторизован как @%s (ID: %d)", self.name, username, self.my_id)
         log.info("[%s] База Excel: %s | Бот активен: %s | Workers: %s", self.name, self.excel_file, self.bot_active, self.client.workers)
+
+        # Мгновенная проверка ночного режима при старте клиента
+        self.check_and_update_night_mode(context="Инициализация при старте")
 
         # Предварительное определение ID бота Дайвинчика (@leomatchbot)
         try:
