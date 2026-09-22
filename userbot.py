@@ -902,7 +902,9 @@ class AccountBot:
 
         self._stop_event: asyncio.Event = asyncio.Event()
         self.resurrector_task: asyncio.Task | None = None
+        self.day_worker_task: asyncio.Task | None = None
         self.night_mode_active: bool = False
+        self.day_mode_event: asyncio.Event = asyncio.Event()
 
         self._register_handlers()
 
@@ -957,35 +959,49 @@ class AccountBot:
         """Проверить, заморожен ли ИИ (выключен вручную или активен режим сна)."""
         return (not self.bot_active) or self.is_bot_asleep()
 
+    def calculate_mode_delta(self, now: datetime | None = None) -> tuple[bool, float, datetime]:
+        """
+        Вычисляет статус ночного режима и точное время сна (дельту) до ближайшей смены фазы:
+        - Ночной диапазон: с 21:00:00 вечера до 09:00:00 утра (с переходом через полночь 00:00).
+        - Дневной диапазон: с 09:00:00 утра до 21:00:00 вечера.
+
+        Возвращает кортеж: (is_night, seconds_to_sleep, target_datetime).
+        """
+        if now is None:
+            now = datetime.now()
+
+        today = now.date()
+        t_09_today = datetime.combine(today, dtime(9, 0, 0))
+        t_21_today = datetime.combine(today, dtime(21, 0, 0))
+
+        if now < t_09_today:
+            # 1. Ночь: текущее время между 00:00:00 и 08:59:59
+            # Целевая точка переключения на ДЕНЬ — 09:00 сегодня
+            is_night = True
+            target_dt = t_09_today
+        elif now < t_21_today:
+            # 2. День: текущее время между 09:00:00 и 20:59:59
+            # Целевая точка переключения на НОЧЬ — 21:00 сегодня
+            is_night = False
+            target_dt = t_21_today
+        else:
+            # 3. Ночь: текущее время между 21:00:00 и 23:59:59
+            # Переход через полночь: целевая точка переключения на ДЕНЬ — 09:00 завтра
+            is_night = True
+            target_dt = datetime.combine(today + timedelta(days=1), dtime(9, 0, 0))
+
+        seconds_to_sleep = (target_dt - now).total_seconds()
+        if seconds_to_sleep <= 0:
+            seconds_to_sleep = 1.0
+
+        return is_night, seconds_to_sleep, target_dt
+
     def is_night_time(self) -> bool:
         """
         Проверка системного времени: попадает ли оно в ночной диапазон с 21:00 вечера до 09:00 утра.
         В этот промежуток юзерботу категорически запрещено писать первым и инициировать диалог.
         """
-        curr_time = datetime.now().time()
-        return curr_time >= dtime(21, 0) or curr_time < dtime(9, 0)
-
-    def check_and_update_night_mode(self, context: str = "Регулярная проверка") -> bool:
-        """
-        Мгновенно проверяет текущее время, обновляет флаг self.night_mode_active и логирует статус.
-        Возвращает True, если ночной режим активен (инициация диалогов запрещена).
-        """
-        is_night = self.is_night_time()
-        self.night_mode_active = is_night
-        time_str = datetime.now().time().strftime("%H:%M:%S")
-
-        if is_night:
-            log.info(
-                "[%s][RESURRECTOR][%s] Ночной режим АКТИВЕН (время: %s, диапазон: 21:00–09:00). "
-                "Флаг запрета инициации диалогов выставлен (сон).",
-                self.name, context, time_str
-            )
-        else:
-            log.info(
-                "[%s][RESURRECTOR][%s] Дневной режим АКТИВЕН (время: %s, рабочий диапазон: 09:00–21:00). "
-                "Инициация диалогов и пинг молчащих чатов РАЗРЕШЕНЫ.",
-                self.name, context, time_str
-            )
+        is_night, _, _ = self.calculate_mode_delta()
         return is_night
 
     def activate_sleep_mode(self) -> None:
@@ -2582,78 +2598,130 @@ class AccountBot:
 
     async def conversation_resurrector(self) -> None:
         """
-        Фоновый планировщик контроля ночного режима и реанимации молчащих диалогов:
-        1. Мгновенная проверка при старте: немедленно проверяет системное время компьютера.
-           Если текущее время в диапазоне с 21:00 до 09:00, бот сразу выставляет флаг
-           запрета инициации диалогов (self.night_mode_active = True), логирует статус
-           и уходит в сон.
-        2. Ежечасный цикл проверки: просыпается ровно раз в 3600 секунд (await asyncio.sleep(3600)),
-           проверяет время и обновляет статус (активен сон или можно писать).
-        3. Безопасность event loop: работает как независимая фоновая задача asyncio.create_task,
-           не блокируется обработчиками сообщений или тяжелым инференсом Qwen.
+        Событийный планировщик ночного режима на основе расчета дельты времени (динамический сон):
+        1. Логика при старте скрипта:
+           - Бот берет текущее локальное время.
+           - Определяет, находится ли он СЕЙЧАС в ночном диапазоне (с 21:00 до 09:00) или в дневном (с 09:00 до 21:00).
+           - Немедленно включает нужный режим: если ночь — блокирует инициацию чатов, если день — разрешает.
+        2. Расчет точного времени сна:
+           - Бот вычисляет, сколько ровно часов, минут и секунд осталось до ближайшей смены режима
+             (до 21:00, если сейчас день, или до 09:00, если сейчас ночь, с надежной обработкой перехода через полночь 00:00).
+           - Переводит это время в секунды (seconds_to_sleep).
+           - Выводит в лог четкое сообщение: [INFO] Режим определен. До смены режима осталось ХХ секунд (ХХ часов). Задача уходит в сон.
+        3. Асинхронный цикл смены фаз:
+           - Бот делает await asyncio.sleep(seconds_to_sleep).
+           - Как только таймер истекает (наступает 09:00 или 21:00), бот просыпается, автоматически меняет
+             статус ночного режима на противоположный, логирует это и заново запускает расчет секунд до следующей точки смены режима.
         """
-        log.info("[%s][RESURRECTOR] Фоновая задача контроля ночного режима и реанимации диалогов запущена", self.name)
-
-        # Шаг 1. Мгновенная проверка при старте (без ожидания первого таймера)
-        is_night = self.check_and_update_night_mode(context="Мгновенная проверка при старте")
-        if is_night:
-            log.info(
-                "[%s][RESURRECTOR] Старт пришелся на ночное время (21:00–09:00). Флаг запрета инициации диалогов выставлен. Уход в сон на 1 час (3600 с)...",
-                self.name
-            )
-        else:
-            # Дневное время — первичная проверка замолчавших чатов
-            if not self.is_ai_frozen():
-                log.info("[%s][RESURRECTOR] Старт в дневное время (09:00–21:00). Первичный опрос молчащих чатов...", self.name)
-                try:
-                    await self._resurrect_silent_chats()
-                except Exception as exc:
-                    log.error("[%s][RESURRECTOR] Ошибка первичного опроса чатов: %s", self.name, exc)
-            else:
-                log.info("[%s][RESURRECTOR] ИИ заморожен при старте — первичный опрос молчащих чатов пропущен", self.name)
-
-        # Шаг 2. Строгий ежечасный цикл проверки (ровно 3600 секунд)
-        CHECK_INTERVAL_SECONDS = 3600
+        log.info("[%s][RESURRECTOR] Событийный планировщик ночного режима (динамический сон) запущен", self.name)
 
         while not self._stop_event.is_set():
             try:
-                # Ожидание 3600 секунд (с поддержкой мгновенной реакции на остановку бота)
+                # Шаг 1: Берем текущее локальное время и определяем режим
+                now = datetime.now()
+                is_night, seconds_to_sleep, target_dt = self.calculate_mode_delta(now)
+
+                # Шаг 2: Немедленно включаем нужный режим
+                self.night_mode_active = is_night
+                if is_night:
+                    self.day_mode_event.clear()
+                    mode_name = "НОЧНОЙ (21:00–09:00, инициация чатов и пинги ЗАБЛОКИРОВАНЫ)"
+                else:
+                    self.day_mode_event.set()
+                    mode_name = "ДНЕВНОЙ (09:00–21:00, инициация чатов и пинги РАЗРЕШЕНЫ)"
+
+                hours = seconds_to_sleep / 3600.0
+                target_str = target_dt.strftime("%H:%M:%S (%d.%m)")
+
+                # Шаг 3: Вывод в лог четкого сообщения по спецификации
+                log.info(
+                    "[%s][RESURRECTOR][INFO] Режим определен: %s. До смены режима осталось %.1f секунд (%.2f часов). Задача уходит в сон до %s.",
+                    self.name, mode_name, seconds_to_sleep, hours, target_str
+                )
+                log.info(
+                    "[%s][INFO] Режим определен. До смены режима осталось %.0f секунд (%.2f часов). Задача уходит в сон.",
+                    self.name, seconds_to_sleep, hours
+                )
+
+                # Шаг 4: Асинхронный сон на точное расчетное время (seconds_to_sleep)
                 try:
-                    await asyncio.wait_for(self._stop_event.wait(), timeout=CHECK_INTERVAL_SECONDS)
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=seconds_to_sleep)
+                    # Если получен сигнал завершения работы бота — выходим из цикла
                     break
                 except asyncio.TimeoutError:
+                    # Таймер истек — наступила точка смены режима (09:00 или 21:00)
                     pass
 
                 if self._stop_event.is_set():
                     break
 
-                # Ежечасная проверка времени и обновление статуса
-                is_night = self.check_and_update_night_mode(context="Ежечасный цикл проверки")
+                # Шаг 5: Просыпаемся и автоматически меняем статус на противоположный
+                now_after = datetime.now()
+                new_is_night, _, _ = self.calculate_mode_delta(now_after)
+                self.night_mode_active = new_is_night
 
-                if is_night:
+                if self.night_mode_active:
+                    self.day_mode_event.clear()
                     log.info(
-                        "[%s][RESURRECTOR] Ночной статус подтвержден. Инициация диалогов запрещена. Следующая проверка через 3600 с.",
+                        "[%s][RESURRECTOR] Наступило 21:00! Смена фазы: Ночной режим АКТИВИРОВАН. "
+                        "Инициация диалогов и пинг молчащих чатов заблокированы до 09:00 утра.",
                         self.name
                     )
+                else:
+                    self.day_mode_event.set()
+                    log.info(
+                        "[%s][RESURRECTOR] Наступило 09:00! Смена фазы: Дневной режим АКТИВИРОВАН. "
+                        "Инициация диалогов и пинг молчащих чатов разрешены до 21:00 вечера.",
+                        self.name
+                    )
+
+            except asyncio.CancelledError:
+                log.debug("[%s][RESURRECTOR] Фоновая задача планировщика ночного режима остановлена", self.name)
+                break
+            except Exception as exc:
+                log.error("[%s][RESURRECTOR] Ошибка в планировщике ночного режима: %s", self.name, exc, exc_info=True)
+                try:
+                    await asyncio.sleep(5)
+                except (asyncio.CancelledError, Exception):
+                    break
+
+    async def silent_chats_resurrector_worker(self) -> None:
+        """
+        Фоновый дневной воркер реанимации молчащих диалогов:
+        Активен строго в дневное время (когда day_mode_event взведен).
+        В ночное время задача находится в ожидании day_mode_event без лишних просыпаний и без ежечасных циклов.
+        """
+        log.info("[%s][RESURRECTOR] Дневной воркер проверки молчащих чатов запущен", self.name)
+        while not self._stop_event.is_set():
+            try:
+                # Ожидание дневного режима
+                await self.day_mode_event.wait()
+                if self._stop_event.is_set():
+                    break
+
+                # Интервал между дневными проверками (20 минут) с реакцией на смену режима/остановку
+                CHECK_INTERVAL = 20 * 60
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=CHECK_INTERVAL)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+                if self._stop_event.is_set() or not self.day_mode_event.is_set() or self.night_mode_active:
                     continue
 
                 if self.is_ai_frozen():
-                    log.info(
-                        "[%s][RESURRECTOR] Дневное время активно, но ИИ заморожен (выключен или режим сна). Пропуск пинга.",
-                        self.name
-                    )
                     continue
 
-                log.info("[%s][RESURRECTOR] Дневное время активно. Запуск плановой проверки замолчавших диалогов...", self.name)
+                log.debug("[%s][RESURRECTOR] Плановый дневной обход молчащих чатов...", self.name)
                 await self._resurrect_silent_chats()
 
             except asyncio.CancelledError:
-                log.debug("[%s][RESURRECTOR] Фоновая задача conversation_resurrector остановлена", self.name)
                 break
             except Exception as exc:
-                log.error("[%s][RESURRECTOR] Непредвиденная ошибка в conversation_resurrector: %s", self.name, exc, exc_info=True)
+                log.error("[%s][RESURRECTOR] Ошибка в дневном воркере обхода чатов: %s", self.name, exc)
                 try:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(10)
                 except (asyncio.CancelledError, Exception):
                     break
 
@@ -2971,9 +3039,6 @@ class AccountBot:
         log.info("[%s] Аккаунт успешно авторизован как @%s (ID: %d)", self.name, username, self.my_id)
         log.info("[%s] База Excel: %s | Бот активен: %s | Workers: %s", self.name, self.excel_file, self.bot_active, self.client.workers)
 
-        # Мгновенная проверка ночного режима при старте клиента
-        self.check_and_update_night_mode(context="Инициализация при старте")
-
         # Предварительное определение ID бота Дайвинчика (@leomatchbot)
         try:
             leobot_peer = await self.client.resolve_peer("leomatchbot")
@@ -2986,9 +3051,12 @@ class AccountBot:
         except Exception as leobot_err:
             log.debug("[%s] Не удалось разрешить peer leomatchbot: %s", self.name, leobot_err)
 
-        # Запуск фоновой задачи реанимации диалогов для живого аккаунта
+        # Запуск событийного планировщика ночного режима (динамический расчет дельты сна)
         self.resurrector_task = asyncio.create_task(
             self.conversation_resurrector(), name=f"resurrector_{self.name}"
+        )
+        self.day_worker_task = asyncio.create_task(
+            self.silent_chats_resurrector_worker(), name=f"day_worker_{self.name}"
         )
 
         # Запуск фонового воркера умного автолайкера Дайвинчика
@@ -3018,6 +3086,13 @@ class AccountBot:
             self.resurrector_task.cancel()
             try:
                 await self.resurrector_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        if self.day_worker_task and not self.day_worker_task.done():
+            self.day_worker_task.cancel()
+            try:
+                await self.day_worker_task
             except (asyncio.CancelledError, Exception):
                 pass
 
