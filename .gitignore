@@ -1,0 +1,55 @@
+# ── Byte-compiled / optimized / cache files ──
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# ── Virtual Environments ──
+.venv/
+venv/
+env/
+ENV/
+
+# ── Secrets & Environment Variables ──
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+
+# ── Pyrogram Sessions & Credentials ──
+*.session
+*.session-journal
+session_string.txt
+sessions/
+
+# ── LoRA Weights, Checkpoints & Large Models ──
+vanya_lora_weights/
+models/
+checkpoint-*/
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# ── Datasets, Chat Dumps & Logs ──
+my_training_dataset.jsonl
+*.jsonl
+raw_chats/
+logs_chats/
+logs/
+*.log
+
+# ── Databases & Personal CRM Tables ──
+databases/
+*.xlsx
+*.xls
+*.csv
+
+# ── IDE, Editor & OS Files ──
+.idea/
+.vscode/
+.cursor/
+.DS_Store
+Thumbs.db
