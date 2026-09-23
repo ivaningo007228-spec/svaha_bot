@@ -1162,6 +1162,10 @@ class AccountBot:
         # Чаты этого аккаунта, чьи таски лежат в модульных pending_messages / debouncer_tasks
         self._debounce_chat_ids: set[int] = set()
         self.typing_activity: dict[int, float] = {}
+        # Один вход в сеть и один цикл «печатает» на весь сбор реплик чата
+        self._compose_tasks: dict[int, asyncio.Task] = {}
+        self._compose_stop: dict[int, asyncio.Event] = {}
+        self._compose_ready: dict[int, asyncio.Event] = {}
 
         self._register_handlers()
 
@@ -2756,6 +2760,61 @@ class AccountBot:
             return False
         return (time.monotonic() - last_seen) < 6.0
 
+    def _start_chat_presence(self, chat_id: int) -> None:
+        """Один раз на пачку: пауза 1–3 сек, затем непрерывный статус «печатает»."""
+        existing = self._compose_tasks.get(chat_id)
+        if existing is not None and not existing.done():
+            return
+        self._compose_stop[chat_id] = asyncio.Event()
+        self._compose_ready[chat_id] = asyncio.Event()
+        self._compose_tasks[chat_id] = asyncio.create_task(
+            self._enter_chat_and_type(chat_id),
+            name=f"compose_{self.name}_{chat_id}",
+        )
+
+    async def _enter_chat_and_type(self, chat_id: int) -> None:
+        """Микро-пауза, вход в сеть и единый цикл ChatAction.TYPING, пока мысль собирается."""
+        ready = self._compose_ready.get(chat_id)
+        stop = self._compose_stop.get(chat_id)
+        try:
+            pause = random.randint(1, 3)
+            log.info(
+                "[%s][DEBOUNCE] Чат %d: уведомление, пауза %d сек перед входом в сеть",
+                self.name, chat_id, pause,
+            )
+            await asyncio.sleep(pause)
+            if stop is None or stop.is_set():
+                return
+            log.info("[%s][DEBOUNCE] Чат %d: вход в сеть, статус «печатает»", self.name, chat_id)
+            while stop is not None and not stop.is_set():
+                try:
+                    await self.client.send_chat_action(chat_id, enums.ChatAction.TYPING)
+                except Exception as exc:
+                    log.debug("[%s][DEBOUNCE] Не удалось обновить TYPING в чате %d: %s", self.name, chat_id, exc)
+                if ready is not None and not ready.is_set():
+                    ready.set()
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=4.0)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if ready is not None and not ready.is_set():
+                ready.set()
+
+    def _stop_chat_presence(self, chat_id: int) -> None:
+        """Останавливает единый цикл печати, не трогая очередь сообщений."""
+        stop = self._compose_stop.pop(chat_id, None)
+        if stop is not None:
+            stop.set()
+        ready = self._compose_ready.pop(chat_id, None)
+        if ready is not None and not ready.is_set():
+            ready.set()
+        task = self._compose_tasks.pop(chat_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
     def _cancel_thought_debounce(self, chat_id: int, *, drop_pending: bool) -> None:
         task = debouncer_tasks.get(chat_id)
         if drop_pending:
@@ -2764,10 +2823,19 @@ class AccountBot:
             self._debounce_chat_ids.discard(chat_id)
         if task and not task.done():
             task.cancel()
+        if drop_pending:
+            self._stop_chat_presence(chat_id)
 
     def _queue_debounced_thought(self, chat_id: int, message: Message, msg_text: str) -> None:
-        """Сбрасывает старый таймер, копит текст и заново ждёт конец мысли."""
+        """Первое сообщение открывает чат. Следующие только сбрасывают 6-секундный таймер."""
+        bucket = pending_messages.get(chat_id) or []
         old_task = debouncer_tasks.get(chat_id)
+        presence = self._compose_tasks.get(chat_id)
+        presence_alive = presence is not None and not presence.done()
+        is_first = (not bucket) and (old_task is None or old_task.done()) and not presence_alive
+        if is_first:
+            self._start_chat_presence(chat_id)
+
         if old_task is not None and not old_task.done():
             old_task.cancel()
 
@@ -2779,24 +2847,27 @@ class AccountBot:
         )
         debouncer_tasks[chat_id] = task
         log.info(
-            "[%s][DEBOUNCE] Чат %d: в очереди %d частей мысли, таймер ожидания перезапущен",
-            self.name, chat_id, len(pending_messages[chat_id]),
+            "[%s][DEBOUNCE] Чат %d: в очереди %d частей мысли, таймер 6 сек %s",
+            self.name,
+            chat_id,
+            len(pending_messages[chat_id]),
+            "запущен после входа в сеть" if is_first else "сброшен, печать не прерывается",
         )
 
     async def wait_for_finishing_thought(self, chat_id: int, original_message: Message) -> None:
         """
-        Ждёт, пока собеседница допишет мысль: 6 секунд тишины, затем ещё по 3 секунды,
-        пока приходят свежие события печати. Отмена не стирает накопленный текст.
+        Ждёт 6 секунд тишины уже после входа в сеть.
+        Отмена таймера не гасит «печатает» и не стирает накопленный текст.
         """
         current = asyncio.current_task()
         try:
-            await asyncio.sleep(6)
-            while self._peer_is_typing(chat_id):
-                if debouncer_tasks.get(chat_id) is not current:
-                    return
-                log.info("[%s][DEBOUNCE] Чат %d всё ещё печатает, ждём ещё 3 сек", self.name, chat_id)
-                await asyncio.sleep(3)
+            ready = self._compose_ready.get(chat_id)
+            if ready is not None and not ready.is_set():
+                await ready.wait()
+            if debouncer_tasks.get(chat_id) is not current or self._stop_event.is_set():
+                return
 
+            await asyncio.sleep(6)
             if debouncer_tasks.get(chat_id) is not current or self._stop_event.is_set():
                 return
             if self.is_ai_frozen():
@@ -2804,29 +2875,49 @@ class AccountBot:
                 pending_messages.pop(chat_id, None)
                 debouncer_tasks.pop(chat_id, None)
                 self._debounce_chat_ids.discard(chat_id)
+                self._stop_chat_presence(chat_id)
                 return
 
-            parts = pending_messages.pop(chat_id, [])
-            debouncer_tasks.pop(chat_id, None)
-            self._debounce_chat_ids.discard(chat_id)
-            combined = "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+            parts = [part.strip() for part in pending_messages.get(chat_id, []) if part and part.strip()]
+            combined = "\n".join(parts).strip()
             if not combined:
+                pending_messages.pop(chat_id, None)
+                debouncer_tasks.pop(chat_id, None)
+                self._debounce_chat_ids.discard(chat_id)
+                self._stop_chat_presence(chat_id)
                 return
 
             log.info(
-                "[%s][DEBOUNCE] Чат %d: мысль собрана из %d сообщений, передаём в пайплайн Qwen",
+                "[%s][DEBOUNCE] Чат %d: тишина 6 сек, мысль из %d сообщений уходит в ask_ai",
                 self.name, chat_id, len(parts),
             )
-            reply_task = asyncio.create_task(
-                self._delayed_reply(original_message, chat_id, combined),
-                name=f"reply_{self.name}_{chat_id}",
-            )
-            chat_info = self.active_chats.get(chat_id)
-            if chat_info is not None:
-                chat_info["reply_task"] = reply_task
+            raw_reply = await self.ask_ai(chat_id, combined, message=original_message)
+            if debouncer_tasks.get(chat_id) is not current or self._stop_event.is_set():
+                return
+            if not raw_reply:
+                log.warning("[%s][DEBOUNCE] Чат %d: модель вернула пустой ответ", self.name, chat_id)
+                pending_messages.pop(chat_id, None)
+                debouncer_tasks.pop(chat_id, None)
+                self._debounce_chat_ids.discard(chat_id)
+                self._stop_chat_presence(chat_id)
+                return
+
+            pending_messages.pop(chat_id, None)
+            debouncer_tasks.pop(chat_id, None)
+            self._debounce_chat_ids.discard(chat_id)
+
+            try:
+                await self.client.read_chat_history(chat_id)
+            except Exception as exc:
+                log.debug("[%s][DEBOUNCE] Не удалось отметить чат %d прочитанным: %s", self.name, chat_id, exc)
+
+            if not pending_messages.get(chat_id) and chat_id not in debouncer_tasks:
+                self._stop_chat_presence(chat_id)
+            await self.process_ai_reply(chat_id, raw_reply, message=original_message, user_text=combined)
+            log.info("[%s][DEBOUNCE] Чат %d: ответ на склеенную мысль отправлен", self.name, chat_id)
         except asyncio.CancelledError:
             log.debug(
-                "[%s][DEBOUNCE] Чат %d: ожидание отменено новым сообщением, накопленный текст сохранён",
+                "[%s][DEBOUNCE] Чат %d: таймер сброшен новым сообщением, печать и очередь сохранены",
                 self.name, chat_id,
             )
             raise
@@ -3485,6 +3576,7 @@ class AccountBot:
             pending_messages.pop(chat_id, None)
             if task and not task.done():
                 task.cancel()
+            self._stop_chat_presence(chat_id)
         self._debounce_chat_ids.clear()
 
         if self.client and self.client.is_connected:
