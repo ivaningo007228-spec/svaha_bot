@@ -887,13 +887,6 @@ def _collapse_trailing_user_burst(dialog_history: list[dict[str, str]], joined_t
             return
 
 
-def _word_core(word: str) -> str:
-    return word.lower().strip(".,!?;:…\"'«»()").strip()
-
-
-_REPLY_CONJUNCTIONS = {"и", "а", "но", "или", "либо", "что", "чтобы", "если", "когда", "хотя", "потому"}
-
-
 def _drop_trailing_sentence_marks(text: str) -> str:
     """Убирает точки и восклицательные знаки только в конце строки. Вопросы не трогает."""
     trimmed = (text or "").strip().rstrip(".!")
@@ -909,107 +902,54 @@ def _soften_internal_periods(text: str) -> str:
         return ", " + nxt.lower()
 
     softened = re.sub(r"\.+\s*([A-Za-zА-Яа-яЁё])?", repl, text or "")
-    softened = softened.replace("!", "")
     softened = re.sub(r"\s+,", ",", softened)
     softened = re.sub(r",(?:\s*,)+", ",", softened)
     softened = re.sub(r"\s+", " ", softened).strip()
     return softened
 
 
-def _render_human_chunk(text: str, *, keep_trailing_comma: bool) -> str:
+def _finish_knife_chunk(body: str, *, keep_question: bool) -> str:
     """
-    В сообщении остаются только запятые и вопросы.
-    Точка на склейке монолога превращается в запятую, финальная точка и «!» стираются.
+    Готовит один кусок после среза по «?» или «!».
+    Вопрос остаётся только в самом конце, если нож был вопросом.
     """
-    body = re.sub(r"\s+", " ", (text or "").strip()).replace("!", "")
-    if not keep_trailing_comma:
-        body = body.rstrip().rstrip(".!")
-    body = _soften_internal_periods(body)
-    body = body.strip().rstrip(".!")
-    body = body.strip()
-    if keep_trailing_comma and body and not body.endswith("?"):
-        body = body.rstrip(",").strip()
-        if body:
-            body += ","
-    return body.strip()
-
-
-def _boundary_kind(prev: str, nxt: str) -> str | None:
-    if re.search(r"\.+$", prev):
-        return "period"
-    if prev.endswith("?") or prev.endswith(","):
-        return "soft"
-    if _word_core(nxt) in _REPLY_CONJUNCTIONS:
-        return "soft"
-    return None
-
-
-def _split_segment_pieces(segment: str) -> list[tuple[str, str]]:
-    """Режет один кусок между «!» на порции. Граница: period, soft или end."""
-    words = segment.split(" ")
-    if not words:
-        return []
-    if len(words) <= 15 and len(segment) <= 100:
-        return [(segment, "end")]
-
-    def find_cut(start: int, remaining: int) -> tuple[int, str]:
-        for kind in ("period", "soft"):
-            for count in range(12, 6, -1):
-                index = start + count
-                if index >= start + remaining:
-                    continue
-                found = _boundary_kind(words[index - 1], words[index])
-                if found == kind:
-                    return index, kind
-        for count in range(13, min(18, remaining)):
-            index = start + count
-            if _boundary_kind(words[index - 1], words[index]) == "period":
-                return index, "period"
-        return start + 12, "soft"
-
-    pieces: list[tuple[str, str]] = []
-    start = 0
-    total = len(words)
-    while start < total:
-        remaining = total - start
-        if remaining <= 12:
-            pieces.append((" ".join(words[start:]), "end"))
-            break
-        cut, kind = find_cut(start, remaining)
-        piece_words = words[start:cut]
-        if kind == "period" and piece_words:
-            piece_words[-1] = piece_words[-1].rstrip(".")
-        pieces.append((" ".join(piece_words), kind))
-        start = cut
-    return pieces
+    text = re.sub(r"\s+", " ", (body or "").strip())
+    text = text.replace("!", "").replace("?", "")
+    text = text.strip().rstrip(".!")
+    text = _soften_internal_periods(text)
+    text = text.strip().rstrip(".!")
+    text = text.rstrip(",").strip()
+    if not text:
+        return ""
+    if keep_question:
+        return f"{text}?"
+    return text
 
 
 def split_reply_chunks(text: str) -> list[str]:
     """
-    Живая нарезка.
-    «!» режет ответ на отдельные сообщения и сам стирается.
-    Длинный монолог по точке расходится на порции, а точка становится запятой.
-    В конце куска не остаётся «.» и «!», вопрос сохраняется.
+    «?» и «!» сразу режут ответ на отдельные сообщения.
+    Вопрос остаётся на конце своего куска, «!» и точки с конца стираются.
+    Точка внутри фразы становится запятой. Пустые куски не возвращаются.
     """
     cleaned = re.sub(r"\s+", " ", (text or "").replace("…", ".").strip())
     if not cleaned:
         return []
 
-    segments = [part.strip() for part in re.split(r"!+", cleaned) if part.strip()]
-    if not segments:
-        return []
-
+    parts = re.split(r"([?!]+)", cleaned)
     chunks: list[str] = []
-    for seg_index, segment in enumerate(segments):
-        pieces = _split_segment_pieces(segment)
-        for piece_index, (body, boundary) in enumerate(pieces):
-            is_last = seg_index == len(segments) - 1 and piece_index == len(pieces) - 1
-            keep_comma = boundary == "period" and not is_last
-            human = _render_human_chunk(body, keep_trailing_comma=keep_comma)
-            human = human.strip().rstrip(".!")
-            human = human.strip()
-            if human:
-                chunks.append(human)
+    index = 0
+    while index < len(parts):
+        body = parts[index]
+        knife = parts[index + 1] if index + 1 < len(parts) else ""
+        index += 2
+        human = _finish_knife_chunk(body, keep_question=("?" in knife))
+        human = human.strip().rstrip(".!") if not human.endswith("?") else human.strip()
+        if human.endswith("?"):
+            human = human[:-1].strip().rstrip(".!").strip()
+            human = f"{human}?" if human else ""
+        if human and human != "?":
+            chunks.append(human)
     return chunks
 
 
@@ -2610,6 +2550,9 @@ class AccountBot:
 
         if reply:
             chunks = split_reply_chunks(reply)
+            if not chunks:
+                log.info("[%s][PROCESS_REPLY] Чат %s: после нарезки отправлять нечего", self.name, chat_id)
+                return
             log.debug(
                 "[%s][PROCESS_REPLY] Отправка клиенту %s: %d частей (reply_link=%s)",
                 self.name, chat_id, len(chunks), should_reply_link,
@@ -2618,7 +2561,7 @@ class AccountBot:
                 if len(chunks) > 1:
                     await self._send_reply_chunks(chat_id, chunks, reply_to_msg_id if should_reply_link else None)
                 else:
-                    text = _drop_trailing_sentence_marks(chunks[0] if chunks else reply)
+                    text = _drop_trailing_sentence_marks(chunks[0])
                     if not text:
                         log.info("[%s][PROCESS_REPLY] Чат %s: после очистки финала отправлять нечего", self.name, chat_id)
                         return
