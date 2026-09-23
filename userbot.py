@@ -599,7 +599,14 @@ async def recall_dialog_memories(chat_id: int | str, user_text: str, limit: int 
     return block
 
 
-async def save_dialog_memory(chat_id: int | str, user_message: str, assistant_reply: str) -> None:
+async def save_dialog_memory(
+    chat_id: int | str,
+    user_message: str,
+    assistant_reply: str,
+    *,
+    embed_text: str | None = None,
+    initiative: bool = False,
+) -> None:
     """Сохраняет успешную пару «сообщение девушки → ответ Вани» в Qdrant."""
     user_message = (user_message or "").strip()
     assistant_reply = (assistant_reply or "").strip()
@@ -608,16 +615,20 @@ async def save_dialog_memory(chat_id: int | str, user_message: str, assistant_re
 
     try:
         numeric_chat_id = _coerce_chat_id(chat_id)
-        vector = await asyncio.to_thread(_embed_text_sync, user_message)
+        vector_source = (embed_text or user_message).strip()
+        vector = await asyncio.to_thread(_embed_text_sync, vector_source)
+        payload: dict[str, object] = {
+            "chat_id": numeric_chat_id,
+            "user_message": user_message,
+            "assistant_reply": assistant_reply,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        if initiative:
+            payload["initiative"] = True
         point = qmodels.PointStruct(
             id=str(uuid.uuid4()),
             vector=vector,
-            payload={
-                "chat_id": numeric_chat_id,
-                "user_message": user_message,
-                "assistant_reply": assistant_reply,
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            },
+            payload=payload,
         )
         await qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=[point])
         log.info(
@@ -745,6 +756,40 @@ SLEEP_AFTER_MY_MSG_MINUTES = 15
 PING_MIN_HOURS = 1.0
 PING_MAX_HOURS = 3.0
 MAX_HISTORY_MESSAGES = 20
+
+# Готовые фразы пинга. Без точек на конце и без эмодзи; одна ")" допустима.
+PING_PHRASES_UNIVERSAL: list[str] = [
+    "привет) как дела?",
+    "приветик, чем занимаешься?",
+    "ку, что делаешь?",
+    "привет, как день проходит?",
+]
+PING_PHRASES_EVENING: list[str] = [
+    "привет, как вечер?",
+    "ку, отдыхаешь уже?",
+    "приветик, какие планы на вечер?",
+]
+PING_PHRASES_DAY: list[str] = [
+    "привет, как бодрячком?",
+    "приветик, хорошего дня) чем занята?",
+]
+
+
+def choose_ping_phrase(now: datetime | None = None) -> tuple[str, str]:
+    """Случайная фраза из пула текущего времени суток. Qwen здесь не участвует."""
+    if now is None:
+        now = datetime.now()
+    hour = now.hour
+    if hour < 12:
+        period = "утро"
+        pool = PING_PHRASES_UNIVERSAL + PING_PHRASES_DAY
+    elif hour < 17:
+        period = "день"
+        pool = PING_PHRASES_UNIVERSAL + PING_PHRASES_DAY
+    else:
+        period = "вечер"
+        pool = PING_PHRASES_UNIVERSAL + PING_PHRASES_EVENING
+    return random.choice(pool), period
 
 # ── Текстовые маркеры и фразы (читаются из .env) ──
 MARKER_INVITATION: str = (os.getenv("MARKER_INVITATION") or "МАРКЕР_ПРИГЛАШЕНИЕ").strip()
@@ -2932,19 +2977,75 @@ class AccountBot:
                 except (asyncio.CancelledError, Exception):
                     break
 
+    def _collect_ping_targets(self) -> list[tuple[int, dict, float]]:
+        """Чаты, где тишина уже дольше случайного порога 1–3 часа и пинг ещё не уходил."""
+        now = datetime.now()
+        targets: list[tuple[int, dict, float]] = []
+        for user_id, chat_data in list(self.active_chats.items()):
+            if isinstance(user_id, str):
+                continue
+            if chat_data.get("pinged") or chat_data.get("last_msg_is_me"):
+                continue
+            last_time = chat_data.get("last_msg_time")
+            if not last_time:
+                continue
+            threshold_h = random.uniform(PING_MIN_HOURS, PING_MAX_HOURS)
+            if isinstance(last_time, (int, float)):
+                elapsed_h = (asyncio.get_event_loop().time() - last_time) / 3600
+            else:
+                elapsed_h = (now - last_time).total_seconds() / 3600
+            if elapsed_h < threshold_h:
+                continue
+            targets.append((user_id, chat_data, elapsed_h))
+        return targets
+
+    async def _send_canned_ping(self, user_id: int, chat_data: dict, phrase: str) -> None:
+        """Вход в сеть, печать 2–3 секунды и готовая фраза без генерации Qwen."""
+        try:
+            await self.client.read_chat_history(user_id)
+        except Exception as exc:
+            log.debug("[%s][RESURRECTOR] Не удалось отметить чат %s прочитанным: %s", self.name, user_id, exc)
+        try:
+            await self.client.send_chat_action(user_id, enums.ChatAction.TYPING)
+        except Exception as exc:
+            log.debug("[%s][RESURRECTOR] Не удалось показать TYPING в чате %s: %s", self.name, user_id, exc)
+        await asyncio.sleep(random.uniform(2.0, 3.0))
+
+        await self.client.send_message(user_id, phrase)
+        chat_data["pinged"] = True
+        self._update_chat_state(user_id, is_me=True)
+        self._append_to_history(user_id, "assistant", phrase)
+        await save_dialog_memory(
+            user_id,
+            "Ваня сам проявил инициативу",
+            phrase,
+            embed_text=phrase,
+            initiative=True,
+        )
+        log.info("[%s][RESURRECTOR] Пинг успешно отправлен клиенту %s: '%s'", self.name, user_id, phrase)
+
     async def _resurrect_silent_chats(self) -> None:
-        """Обход активных чатов и отправка ненавязчивого пинга, если собеседник долго молчит."""
+        """По одному пингует молчащие чаты готовой фразой. Между чатами пауза 2–5 минут."""
         if self.is_night_time() or self.night_mode_active or self.is_ai_frozen():
             log.info("[%s][RESURRECTOR] Проверка чатов отменена: активен ночной режим или ИИ заморожен", self.name)
             return
 
-        now = datetime.now()
-        for user_id, chat_data in list(self.active_chats.items()):
-            # Пропускаем строковые ключи-дубликаты при переборе
-            if isinstance(user_id, str):
-                continue
+        targets = self._collect_ping_targets()
+        if not targets:
+            return
 
-            # Проверяем ночной режим на каждой итерации перебора чатов
+        log.info("[%s][RESURRECTOR] К пингу подходит чатов: %d. Отправка строго по одному", self.name, len(targets))
+        for index, (user_id, chat_data, elapsed_h) in enumerate(targets):
+            if index > 0:
+                pause_sec = random.randint(120, 300)
+                log.info(
+                    "[%s][RESURRECTOR] Пауза %d сек перед следующим чатом, чтобы не слать пачку",
+                    self.name, pause_sec,
+                )
+                await asyncio.sleep(pause_sec)
+
+            if self._stop_event.is_set():
+                break
             if self.is_night_time() or self.night_mode_active:
                 log.info(
                     "[%s][RESURRECTOR] Наступило ночное время (%s). Прерываем пинг чатов.",
@@ -2953,73 +3054,26 @@ class AccountBot:
                 )
                 self.night_mode_active = True
                 break
-
-            if chat_data.get("pinged"):
-                continue
-            if chat_data.get("last_msg_is_me"):
-                continue
-
-            last_time = chat_data.get("last_msg_time")
-            if not last_time:
-                continue
-
-            threshold_h = random.uniform(PING_MIN_HOURS, PING_MAX_HOURS)
-            if isinstance(last_time, (int, float)):
-                elapsed_h = (asyncio.get_event_loop().time() - last_time) / 3600
-            else:
-                elapsed_h = (now - last_time).total_seconds() / 3600
-
-            if elapsed_h < threshold_h:
+            reply_task = chat_data.get("reply_task")
+            if (
+                self.is_ai_frozen()
+                or chat_data.get("pinged")
+                or chat_data.get("last_msg_is_me")
+                or (reply_task and not reply_task.done())
+            ):
                 continue
 
+            phrase, period = choose_ping_phrase()
             log.info(
-                "[%s][RESURRECTOR] Пинг чата %s — тишина %.1f ч (порог %.1f ч)",
-                self.name, user_id, elapsed_h, threshold_h
+                "[%s][RESURRECTOR] Пинг чата %s — тишина %.1f ч, период '%s', фраза из базы",
+                self.name, user_id, elapsed_h, period,
             )
-
-            client_row = await self.excel_read_client(user_id)
-            hobby_hint = ""
-            if client_row and client_row.get("Увлечения/Хобби"):
-                hobby_hint = (
-                    f"У клиента есть хобби: {client_row['Увлечения/Хобби']}. "
-                    "Можешь упомянуть его, чтобы пинг звучал естественнее. "
-                )
-
-            ping_prompt = (
-                f"Диалог прервался примерно на {elapsed_h:.1f} ч. "
-                f"{hobby_hint}"
-                "Напиши короткое, ненавязчивое сообщение в одно предложение, "
-                "чтобы возобновить беседу или узнать как дела."
-            )
-
             try:
-                log.info("[%s][RESURRECTOR] Пинг чата %s: запрос фразы к ИИ...", self.name, user_id)
-                raw_reply = await self.ask_ai(user_id, ping_prompt)
-                if raw_reply:
-                    clean = raw_reply.replace(MARKER_INVITATION, "").replace(INVITE_MARKER, "")
-                    clean = re.sub(r"ОБНОВИТЬ_ДАННЫЕ:.*", "", clean).strip()
-                    clean = re.sub(r"<think>[\s\S]*?</think>", "", clean).strip()
-                    clean = re.sub(r"\s*\){2,}$", "", clean).strip()
-                    if clean:
-                        # Имитируем набор текста перед отправкой пинга
-                        try:
-                            await self.client.send_chat_action(user_id, enums.ChatAction.TYPING)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(random.uniform(2.0, 4.0))
-
-                        log.info("[%s][RESURRECTOR] Пинг чата %s: отправка сообщения '%s'...", self.name, user_id, clean[:50])
-                        await self.client.send_message(user_id, clean)
-                        chat_data["pinged"] = True
-                        self._update_chat_state(user_id, is_me=True)
-                        self._append_to_history(user_id, "assistant", clean)
-                        log.info("[%s][RESURRECTOR] Пинг успешно отправлен клиенту %s", self.name, user_id)
-            except Exception as exc:
-                log.error("[%s][RESURRECTOR] Ошибка отправки пинга клиенту %s: %s", self.name, user_id, exc)
+                await self._send_canned_ping(user_id, chat_data, phrase)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("[%s][RESURRECTOR] Ошибка в conversation_resurrector: %s", self.name, exc)
+                log.error("[%s][RESURRECTOR] Ошибка отправки пинга клиенту %s: %s", self.name, user_id, exc)
 
     def _extract_girl_id_from_leobot(self, message: Message) -> tuple[str | None, str]:
         """
