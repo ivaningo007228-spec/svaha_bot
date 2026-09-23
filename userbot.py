@@ -603,6 +603,88 @@ async def recall_dialog_memories(chat_id: int | str, user_text: str, limit: int 
     return block
 
 
+_QDRANT_PROFILE_KEYS = {
+    "имя": "Имя",
+    "name": "Имя",
+    "возраст": "Возраст",
+    "age": "Возраст",
+    "город": "Город",
+    "city": "Город",
+    "хобби": "Увлечения/Хобби",
+    "увлечение": "Увлечения/Хобби",
+    "увлечения": "Увлечения/Хобби",
+    "hobby": "Увлечения/Хобби",
+    "hobbies": "Увлечения/Хобби",
+}
+
+
+def _merge_profile_payload(target: dict[str, str], payload: dict) -> None:
+    """Забирает из payload Qdrant уже известные слоты профиля, пустые ячейки не затирает."""
+    for key, value in payload.items():
+        column = _QDRANT_PROFILE_KEYS.get(str(key).strip().lower())
+        if column is None or _profile_cell_empty(value):
+            continue
+        if _profile_cell_empty(target.get(column), name_field=(column == "Имя")):
+            target[column] = str(value).strip()
+
+    nested = payload.get("profile")
+    if isinstance(nested, dict):
+        _merge_profile_payload(target, nested)
+
+    blob = f"{payload.get('assistant_reply') or ''}\n{payload.get('user_message') or ''}"
+    marker = re.search(r"ОБНОВИТЬ_ДАННЫЕ:\s*([^\n]+)", blob, re.IGNORECASE)
+    if not marker:
+        return
+    for pattern, field in _PROFILE_MARKER_FIELDS:
+        found = re.search(pattern, marker.group(1), re.IGNORECASE)
+        if found and _profile_cell_empty(target.get(field), name_field=(field == "Имя")):
+            target[field] = found.group(1).strip()
+
+
+async def collect_profile_from_qdrant(chat_id: int | str) -> dict[str, str]:
+    """Читает накопленные точки этого chat_id и вытаскивает известные слоты профиля."""
+    found: dict[str, str] = {}
+    if not _memory_ready or qdrant_client is None:
+        return found
+    try:
+        numeric_chat_id = _coerce_chat_id(chat_id)
+    except ValueError:
+        return found
+
+    query_filter = qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(
+                key="chat_id",
+                match=qmodels.MatchValue(value=numeric_chat_id),
+            )
+        ]
+    )
+    offset = None
+    seen = 0
+    try:
+        while seen < 200:
+            points, offset = await qdrant_client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                scroll_filter=query_filter,
+                limit=64,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                break
+            for point in points:
+                payload = getattr(point, "payload", None) or {}
+                if isinstance(payload, dict):
+                    _merge_profile_payload(found, payload)
+                seen += 1
+            if offset is None:
+                break
+    except Exception as exc:
+        log.warning("[SLOTS] Qdrant не отдал профиль чата %s: %s", chat_id, exc)
+    return found
+
+
 async def save_dialog_memory(
     chat_id: int | str,
     user_message: str,
@@ -661,6 +743,7 @@ EXCEL_COLUMNS = [
     "Место учебы",
     "Увлечения/Хобби",
     "Доп. инфо",
+    "Город",
 ]
 
 # ── Синхронные функции работы с файлами для вызова через asyncio.to_thread ──
@@ -711,6 +794,30 @@ def _sync_read_chat_log_window(user_id: int | str, limit: int = 15) -> list[dict
     except Exception as exc:
         log.error("Ошибка чтения файла лога чата %s: %s", filepath, exc)
         return []
+
+
+def _excel_headers(ws) -> list:
+    headers: list = []
+    column = 1
+    while column <= max(ws.max_column or 1, 1):
+        value = ws.cell(row=1, column=column).value
+        if value in (None, ""):
+            break
+        headers.append(value)
+        column += 1
+    return headers
+
+
+def _ensure_excel_headers(ws) -> bool:
+    """Дописывает в шапку недостающие колонки, старые строки не сдвигает."""
+    headers = _excel_headers(ws)
+    changed = False
+    for column_name in EXCEL_COLUMNS:
+        if column_name not in headers:
+            ws.cell(row=1, column=len(headers) + 1, value=column_name)
+            headers.append(column_name)
+            changed = True
+    return changed
 
 
 def _sync_ensure_seen_users_excel(filepath: Path) -> None:
@@ -795,6 +902,65 @@ def _collapse_trailing_user_burst(dialog_history: list[dict[str, str]], joined_t
             return
         if len(collected) > 12:
             return
+
+
+def _word_core(word: str) -> str:
+    return word.lower().strip(".,!?;:…\"'«»()").strip()
+
+
+_REPLY_CONJUNCTIONS = {"и", "а", "но", "или", "либо", "что", "чтобы", "если", "когда", "хотя", "потому"}
+
+
+def split_reply_chunks(text: str) -> list[str]:
+    """
+    Короткий ответ остаётся одним сообщением.
+    Длинный (больше 15 слов или 100 символов) режется по предложениям, запятым и союзам
+    на порции примерно по 7–12 слов.
+    """
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return []
+    words = cleaned.split(" ")
+    if len(words) <= 15 and len(cleaned) <= 100:
+        return [cleaned]
+
+    def boundary_before(index: int) -> bool:
+        if index <= 0 or index >= len(words):
+            return False
+        prev = words[index - 1]
+        if re.search(r"[.!?…]$", prev) or prev.endswith(","):
+            return True
+        return _word_core(words[index]) in _REPLY_CONJUNCTIONS
+
+    chunks: list[str] = []
+    start = 0
+    total = len(words)
+    while start < total:
+        remaining = total - start
+        if remaining <= 12:
+            tail = " ".join(words[start:]).strip(" ,")
+            if tail:
+                chunks.append(tail)
+            break
+        cut = None
+        for count in range(12, 6, -1):
+            index = start + count
+            if boundary_before(index):
+                cut = index
+                break
+        if cut is None:
+            for count in range(13, min(18, remaining)):
+                index = start + count
+                if boundary_before(index):
+                    cut = index
+                    break
+        if cut is None:
+            cut = start + 12
+        piece = " ".join(words[start:cut]).strip(" ,")
+        if piece:
+            chunks.append(piece)
+        start = cut
+    return chunks or [cleaned]
 
 
 def choose_ping_phrase(now: datetime | None = None) -> tuple[str, str]:
@@ -888,7 +1054,7 @@ DEFAULT_SYSTEM_PROMPT = """\
 
 А. ОБНОВЛЕНИЕ ДАННЫХ (Excel):
 Если в процессе диалога девушка сообщила какой-то новый факт о себе (свой точный возраст, где учится, чем увлекается или как её зовут, если имя не было известно), ты ОБЯЗАН в самом конце своего текстового ответа дописать скрытый сервисный маркер строго в таком формате:
-ОБНОВИТЬ_ДАННЫЕ: имя=[значение], возраст=[значение], учеба=[значение], хобби=[значение]
+ОБНОВИТЬ_ДАННЫЕ: имя=[значение], возраст=[значение], город=[значение], учеба=[значение], хобби=[значение]
 (Пиши только те поля, которые она реально назвала. Если ничего нового не сказала — маркер не пишется).
 
 Б. ПЕРЕХВАТ ПРИГЛАШЕНИЙ (Свидание):
@@ -969,6 +1135,68 @@ def is_valid_name(name_str: str | None) -> bool:
 Is_valid_name = is_valid_name
 
 
+# Порядок важен: бот выведывает ровно первый пустой слот.
+PROFILE_SLOTS: tuple[tuple[str, str], ...] = (
+    ("Имя", "Имя"),
+    ("Возраст", "Возраст"),
+    ("Город", "Город"),
+    ("Увлечение", "Увлечения/Хобби"),
+)
+
+_EMPTY_PROFILE_TOKENS = {
+    "",
+    "none",
+    "null",
+    "неизвестно",
+    "unknown",
+    "клиент",
+    "-",
+    "—",
+}
+
+_PROFILE_MARKER_FIELDS = (
+    (r"имя=([^,\n]+)", "Имя"),
+    (r"возраст=([^,\n]+)", "Возраст"),
+    (r"город=([^,\n]+)", "Город"),
+    (r"учеба=([^,\n]+)", "Место учебы"),
+    (r"хобби=([^,\n]+)", "Увлечения/Хобби"),
+    (r"увлечение=([^,\n]+)", "Увлечения/Хобби"),
+)
+
+
+def _profile_cell_empty(value: object, *, name_field: bool = False) -> bool:
+    """Пусто, если значения нет, это пробелы, заглушка или (для имени) не человеческое имя."""
+    if value is None:
+        return True
+    text = str(value).strip()
+    if not text or text.lower() in _EMPTY_PROFILE_TOKENS:
+        return True
+    if name_field and not is_valid_name(text):
+        return True
+    return False
+
+
+def missing_slots_from_profile(row: dict | None) -> list[str]:
+    """Возвращает подписи только тех слотов, которые в строке профиля сейчас пустые."""
+    source = row or {}
+    missing: list[str] = []
+    for label, column in PROFILE_SLOTS:
+        if _profile_cell_empty(source.get(column), name_field=(column == "Имя")):
+            missing.append(label)
+    return missing
+
+
+def build_slot_goal(slot: str) -> str:
+    """Скрытая микро-инструкция: один факт за раз, без допроса."""
+    return (
+        f"ТЕКУЩАЯ ТАКТИЧЕСКАЯ ЦЕЛЬ: Ты до сих пор не знаешь {slot} девушки. "
+        "Твоя задача — максимально естественно, коротко и ненавязчиво вплести в свой ответ встречный вопрос, "
+        "чтобы узнать этот факт. Не спрашивай про остальные вещи. Если все данные уже заполнены, общайся на свободные темы. "
+        "Спрашивай строго про один факт за раз и только тогда, когда это уместно по контексту переписки. "
+        "Не будь допрашивающим роботом."
+    )
+
+
 UNKNOWN_NAME_INSTRUCTION = (
     "ВНИМАНИЕ: Имя девушки тебе НЕИЗВЕСТНО. Тебе СТРОГО ЗАПРЕЩЕНО выдумывать ей имя или использовать её никнейм. "
     "Ты ОБЯЗАН в этом сообщении лаконично и ненавязчиво, в своем пацанском стиле, спросить как её зовут. "
@@ -989,6 +1217,15 @@ def _get_time_schedule_prompt() -> str:
     )
 
 
+def _with_city_marker(prompt: str) -> str:
+    """В уже загруженном промпте маркер обновления тоже умеет принимать город."""
+    if re.search(r"город\s*=", prompt, re.IGNORECASE):
+        return prompt
+    if "хобби=[значение]" in prompt:
+        return prompt.replace("хобби=[значение]", "город=[значение], хобби=[значение]", 1)
+    return prompt
+
+
 def _build_system_prompt(client_row: dict | None, name: str | None = None) -> str:
     """Сформировать системный промпт с динамическим временем на ПК, блоком контекста из Excel и инструкцией по имени."""
     effective_name = name
@@ -999,17 +1236,19 @@ def _build_system_prompt(client_row: dict | None, name: str | None = None) -> st
     if effective_name and is_valid_name(effective_name):
         context_parts.append(f"имя: {effective_name}")
 
-    if client_row:
-        if client_row.get("Возраст"):
-            context_parts.append(f"возраст: {client_row['Возраст']}")
-        if client_row.get("Место учебы"):
-            context_parts.append(f"место учёбы: {client_row['Место учебы']}")
-        if client_row.get("Увлечения/Хобби"):
-            context_parts.append(f"хобби: {client_row['Увлечения/Хобби']}")
-        if client_row.get("Доп. инфо"):
-            context_parts.append(f"доп. инфо: {client_row['Доп. инфо']}")
+        if client_row:
+            if not _profile_cell_empty(client_row.get("Возраст")):
+                context_parts.append(f"возраст: {client_row['Возраст']}")
+            if not _profile_cell_empty(client_row.get("Город")):
+                context_parts.append(f"город: {client_row['Город']}")
+            if not _profile_cell_empty(client_row.get("Место учебы")):
+                context_parts.append(f"место учёбы: {client_row['Место учебы']}")
+            if not _profile_cell_empty(client_row.get("Увлечения/Хобби")):
+                context_parts.append(f"хобби: {client_row['Увлечения/Хобби']}")
+            if not _profile_cell_empty(client_row.get("Доп. инфо")):
+                context_parts.append(f"доп. инфо: {client_row['Доп. инфо']}")
 
-    prompt_body = SYSTEM_PROMPT
+    prompt_body = _with_city_marker(SYSTEM_PROMPT)
     if effective_name == "Неизвестно" or (effective_name is not None and not is_valid_name(effective_name)):
         prompt_body = f"{UNKNOWN_NAME_INSTRUCTION}\n\n{SYSTEM_PROMPT}"
 
@@ -1170,6 +1409,7 @@ class AccountBot:
         self._typing_tasks: dict[int, asyncio.Task] = {}
         self._typing_stop: dict[int, asyncio.Event] = {}
         self._generate_tasks: dict[int, asyncio.Task] = {}
+        self._chunk_tasks: dict[int, asyncio.Task] = {}
 
         self._register_handlers()
 
@@ -1297,8 +1537,17 @@ class AccountBot:
                 log.info("[%s] Создан файл БД: %s", self.name, self.excel_file)
             finally:
                 wb.close()
-        else:
-            log.info("[%s] Файл БД %s уже существует, используем его.", self.name, self.excel_file)
+            return
+        wb = load_workbook(self.excel_file)
+        try:
+            ws = wb.active
+            if _ensure_excel_headers(ws):
+                wb.save(self.excel_file)
+                log.info("[%s] В %s добавлена колонка профиля «Город»", self.name, self.excel_file.name)
+            else:
+                log.info("[%s] Файл БД %s уже существует, используем его.", self.name, self.excel_file)
+        finally:
+            wb.close()
 
     async def ensure_excel(self) -> None:
         """Убедиться, что файл dates_{name}.xlsx существует со всеми колонками (в отдельном потоке)."""
@@ -1613,6 +1862,7 @@ class AccountBot:
         study: str = "",
         hobby: str = "",
         extra: str = "",
+        city: str = "",
     ) -> None:
         """Добавить новую строку в Excel под блокировкой (в отдельном потоке)."""
         log.debug("[%s][EXCEL_APPEND] Ожидание блокировки excel_lock для %s (%s)...", self.name, name, user_id)
@@ -1624,7 +1874,19 @@ class AccountBot:
                     wb = load_workbook(self.excel_file)
                     try:
                         ws = wb.active
-                        ws.append([name, str(user_id), date_str, age, study, hobby, extra])
+                        _ensure_excel_headers(ws)
+                        headers = _excel_headers(ws)
+                        values = {
+                            "Имя": name,
+                            "Username/ID": str(user_id),
+                            "Дата приглашения": date_str,
+                            "Возраст": age,
+                            "Место учебы": study,
+                            "Увлечения/Хобби": hobby,
+                            "Доп. инфо": extra,
+                            "Город": city,
+                        }
+                        ws.append([values.get(header, "") for header in headers])
                         wb.save(self.excel_file)
                         log.info("[%s][EXCEL_APPEND] Запись сохранена: %s (%s)", self.name, name, user_id)
                     finally:
@@ -1648,7 +1910,8 @@ class AccountBot:
                     wb = load_workbook(self.excel_file)
                     try:
                         ws = wb.active
-                        headers = [cell.value for cell in ws[1]]
+                        _ensure_excel_headers(ws)
+                        headers = _excel_headers(ws)
                         if field not in headers or "Username/ID" not in headers:
                             return
                         col_idx = headers.index(field) + 1
@@ -1811,12 +2074,7 @@ class AccountBot:
         log.info("[%s][MARKER] Обработка маркера данных: '%s' для user_id=%s", self.name, data_str, user_id)
         chat_data = self.active_chats.get(user_id) or self.active_chats.get(str(user_id), {})
         username = chat_data.get("username", str(user_id))
-        for pattern, field in [
-            (r"имя=([^,\n]+)", "Имя"),
-            (r"учеба=([^,\n]+)", "Место учебы"),
-            (r"хобби=([^,\n]+)", "Увлечения/Хобби"),
-            (r"возраст=([^,\n]+)", "Возраст"),
-        ]:
+        for pattern, field in _PROFILE_MARKER_FIELDS:
             m = re.search(pattern, data_str, re.IGNORECASE)
             if m:
                 val = m.group(1).strip()
@@ -1836,6 +2094,45 @@ class AccountBot:
                     if str(user_id) != username:
                         await self.excel_update_field(str(user_id), field, val)
         log.info("[%s][MARKER] Обработка маркера данных для %s завершена", self.name, user_id)
+
+    async def get_missing_profile_slots(
+        self,
+        chat_id: int | str,
+        client_row: dict | None = None,
+    ) -> list[str]:
+        """
+        Слоты профиля, которых сейчас нет ни в Excel, ни в памяти Qdrant этого чата.
+        Порядок: имя, возраст, город, увлечение. Пустые — None, пустая строка или отсутствие поля.
+        """
+        chat_data = self.active_chats.get(chat_id) or self.active_chats.get(str(chat_id), {})
+        username = chat_data.get("username")
+        row = client_row
+        if row is None:
+            row = await self.excel_read_client(chat_id)
+            if not row and username:
+                row = await self.excel_read_client(username)
+
+        merged: dict = dict(row or {})
+        live_name = chat_data.get("name")
+        if _profile_cell_empty(merged.get("Имя"), name_field=True) and is_valid_name(live_name):
+            merged["Имя"] = live_name
+
+        if missing_slots_from_profile(merged):
+            qdrant_facts = await collect_profile_from_qdrant(chat_id)
+            for column, value in qdrant_facts.items():
+                if _profile_cell_empty(merged.get(column), name_field=(column == "Имя")) and not _profile_cell_empty(
+                    value, name_field=(column == "Имя")
+                ):
+                    merged[column] = value
+
+        missing = missing_slots_from_profile(merged)
+        log.info(
+            "[%s][SLOTS] Чат %s: пустые слоты — %s",
+            self.name,
+            chat_id,
+            ", ".join(missing) if missing else "нет",
+        )
+        return missing
 
     # ── Генерация ответа ИИ (Локальная модель Transformers + LoRA) ──────────
 
@@ -1873,6 +2170,13 @@ class AccountBot:
         memory_block = await recall_dialog_memories(user_id, str(user_text))
         if memory_block:
             system_prompt = f"{memory_block}\n\n{system_prompt}"
+
+        # 1.2. Одна тактическая цель: выведать ровно один пустой слот профиля
+        missing_slots = await self.get_missing_profile_slots(user_id, client_row=client_row)
+        if missing_slots:
+            slot = missing_slots[0]
+            system_prompt = f"{system_prompt}\n\n{build_slot_goal(slot)}"
+            log.info("[%s][SLOTS] Чат %s: тактическая цель — %s", self.name, user_id, slot)
 
         # 2. Скользящее окно контекста: считываем ТОЛЬКО последние 10-15 сообщений из logs_chats/{user_id}.txt
         history = await self.read_chat_log_window(user_id, limit=15)
@@ -2017,6 +2321,69 @@ class AccountBot:
             return
         await save_dialog_memory(chat_id, user_message, assistant_reply)
 
+    async def _hold_typing(self, chat_id: int | str, seconds: float) -> None:
+        """Держит статус печати заданное время, обновляя его каждые 4 секунды."""
+        elapsed = 0.0
+        while elapsed < seconds:
+            try:
+                await self.client.send_chat_action(chat_id, enums.ChatAction.TYPING)
+            except Exception as exc:
+                log.debug("[%s][PROCESS_REPLY] Не удалось показать TYPING в %s: %s", self.name, chat_id, exc)
+            step = min(4.0, seconds - elapsed)
+            await asyncio.sleep(step)
+            elapsed += step
+
+    async def _send_reply_chunks(
+        self,
+        chat_id: int | str,
+        chunks: list[str],
+        reply_to_msg_id: int | None,
+    ) -> None:
+        """
+        Шлёт длинный ответ порциями. Между кусками печать гаснет на 1.5–3 секунды.
+        Новое сообщение девушки отменяет этот цикл через _chunk_tasks.
+        """
+        task_key = chat_id
+        self._chunk_tasks[task_key] = asyncio.current_task()
+        try:
+            for index, chunk in enumerate(chunks):
+                typing_for = min(5.0, max(2.0, len(chunk) * 0.05))
+                log.info(
+                    "[%s][PROCESS_REPLY] Чат %s: печать %.1f с, кусок %d/%d",
+                    self.name, chat_id, typing_for, index + 1, len(chunks),
+                )
+                await self._hold_typing(chat_id, typing_for)
+                try:
+                    if index == 0 and reply_to_msg_id:
+                        await self.client.send_message(chat_id, chunk, reply_to_message_id=reply_to_msg_id)
+                    else:
+                        await self.client.send_message(chat_id, chunk)
+                except Exception as send_err:
+                    log.warning(
+                        "[%s][PROCESS_REPLY] Ошибка отправки куска %d (%s), повтор без reply: %s",
+                        self.name, index + 1, reply_to_msg_id, send_err,
+                    )
+                    await self.client.send_message(chat_id, chunk)
+                self._append_to_history(chat_id, "assistant", chunk)
+                self._update_chat_state(chat_id, is_me=True)
+                if index < len(chunks) - 1:
+                    try:
+                        await self.client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
+                    except Exception as exc:
+                        log.debug("[%s][PROCESS_REPLY] Не удалось снять TYPING в %s: %s", self.name, chat_id, exc)
+                    breath = random.uniform(1.5, 3.0)
+                    log.info("[%s][PROCESS_REPLY] Чат %s: пауза %.1f с перед следующей мыслью", self.name, chat_id, breath)
+                    await asyncio.sleep(breath)
+        except asyncio.CancelledError:
+            try:
+                await self.client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
+            except Exception:
+                pass
+            raise
+        finally:
+            if self._chunk_tasks.get(task_key) is asyncio.current_task():
+                self._chunk_tasks.pop(task_key, None)
+
     async def process_ai_reply(
         self,
         chat_id: int | str,
@@ -2108,20 +2475,32 @@ class AccountBot:
             return
 
         if reply:
-            log.debug("[%s][PROCESS_REPLY] Отправка сообщения клиенту %s (reply_link=%s)...", self.name, chat_id, should_reply_link)
+            chunks = split_reply_chunks(reply)
+            log.debug(
+                "[%s][PROCESS_REPLY] Отправка клиенту %s: %d частей (reply_link=%s)",
+                self.name, chat_id, len(chunks), should_reply_link,
+            )
             try:
-                if should_reply_link and reply_to_msg_id:
-                    await self.client.send_message(chat_id, reply, reply_to_message_id=reply_to_msg_id)
+                if len(chunks) > 1:
+                    await self._send_reply_chunks(chat_id, chunks, reply_to_msg_id if should_reply_link else None)
                 else:
-                    await self.client.send_message(chat_id, reply)
-            except Exception as send_err:
-                log.warning("[%s][PROCESS_REPLY] Ошибка отправки с reply_to_message_id (%s), пробуем обычный send_message: %s", self.name, reply_to_msg_id, send_err)
-                await self.client.send_message(chat_id, reply)
-            self._append_to_history(chat_id, "assistant", reply)
-            self._update_chat_state(chat_id, is_me=True)
+                    text = chunks[0] if chunks else reply
+                    try:
+                        if should_reply_link and reply_to_msg_id:
+                            await self.client.send_message(chat_id, text, reply_to_message_id=reply_to_msg_id)
+                        else:
+                            await self.client.send_message(chat_id, text)
+                    except Exception as send_err:
+                        log.warning("[%s][PROCESS_REPLY] Ошибка отправки с reply_to_message_id (%s), пробуем обычный send_message: %s", self.name, reply_to_msg_id, send_err)
+                        await self.client.send_message(chat_id, text)
+                    self._append_to_history(chat_id, "assistant", text)
+                    self._update_chat_state(chat_id, is_me=True)
+            except asyncio.CancelledError:
+                log.info("[%s][PROCESS_REPLY] Отправка порций клиенту %s прервана новым сообщением", self.name, chat_id)
+                raise
             log.info(
-                "[%s][PROCESS_REPLY] Ответ успешно отправлен клиенту %s (reply_link=%s, msg_id=%s): '%s'",
-                self.name, chat_id, should_reply_link, reply_to_msg_id, reply[:60].replace("\n", " ")
+                "[%s][PROCESS_REPLY] Ответ успешно отправлен клиенту %s (%d сообщ.): '%s'",
+                self.name, chat_id, len(chunks), reply[:60].replace("\n", " ")
             )
             await self._remember_successful_reply(chat_id, message, reply, user_text=user_text)
 
@@ -2770,9 +3149,11 @@ class AccountBot:
     def _writer_active(self, chat_id: int) -> bool:
         typing_task = self._typing_tasks.get(chat_id)
         generate_task = self._generate_tasks.get(chat_id)
+        chunk_task = self._chunk_tasks.get(chat_id)
         typing_alive = typing_task is not None and not typing_task.done()
         generate_alive = generate_task is not None and not generate_task.done()
-        return typing_alive or generate_alive
+        chunk_alive = chunk_task is not None and not chunk_task.done()
+        return typing_alive or generate_alive or chunk_alive
 
     def _start_listener(self, chat_id: int) -> None:
         """Первое сообщение: пауза 1–3 сек и вход в сеть без статуса печати."""
@@ -2873,6 +3254,9 @@ class AccountBot:
         generate_task = self._generate_tasks.get(chat_id)
         if generate_task is not None and not generate_task.done():
             generate_task.cancel()
+        chunk_task = self._chunk_tasks.get(chat_id)
+        if chunk_task is not None and not chunk_task.done():
+            chunk_task.cancel()
         asyncio.create_task(
             self._send_typing_cancel(chat_id),
             name=f"typing_cancel_{self.name}_{chat_id}",
@@ -2898,22 +3282,15 @@ class AccountBot:
 
     def _queue_debounced_thought(self, chat_id: int, message: Message, msg_text: str) -> None:
         """Слушатель копит текст. Если Ваня уже печатает, он замолкает и снова ждёт."""
-        bucket = pending_messages.get(chat_id) or []
         old_task = debouncer_tasks.get(chat_id)
         listen = self._listen_tasks.get(chat_id)
         listen_alive = listen is not None and not listen.done()
-        is_first = (
-            (not bucket)
-            and (old_task is None or old_task.done())
-            and not listen_alive
-            and not self._writer_active(chat_id)
-        )
 
         if self._writer_active(chat_id):
             log.info("[%s][DEBOUNCE] Чат %d: девушка перебила набор, Ваня замолкает", self.name, chat_id)
             self._silence_writer(chat_id)
 
-        if is_first:
+        if not listen_alive:
             self._start_listener(chat_id)
 
         if old_task is not None and not old_task.done():
@@ -2927,13 +3304,13 @@ class AccountBot:
         )
         debouncer_tasks[chat_id] = task
         log.info(
-            "[%s][DEBOUNCE] Чат %d: в очереди %d частей, режим слушателя, таймер 6 сек",
+            "[%s][DEBOUNCE] Чат %d: в очереди %d частей, режим слушателя, таймер 1.5–4 сек",
             self.name, chat_id, len(pending_messages[chat_id]),
         )
 
     async def wait_for_finishing_thought(self, chat_id: int, original_message: Message) -> None:
         """
-        6 секунд тишины без статуса печати. Потом TYPING и ask_ai.
+        Случайная тишина 1.5–4 секунды без статуса печати. Потом TYPING и ask_ai.
         Отмена не удаляет накопленный текст и не роняет юзербота.
         """
         current = asyncio.current_task()
@@ -2944,7 +3321,12 @@ class AccountBot:
             if debouncer_tasks.get(chat_id) is not current or self._stop_event.is_set():
                 return
 
-            await asyncio.sleep(6)
+            silence = random.uniform(1.5, 4.0)
+            log.info(
+                "[%s][DEBOUNCE] Чат %d: ждём тишину %.1f сек",
+                self.name, chat_id, silence,
+            )
+            await asyncio.sleep(silence)
             if debouncer_tasks.get(chat_id) is not current or self._stop_event.is_set():
                 return
             if self.is_ai_frozen():
@@ -2966,7 +3348,7 @@ class AccountBot:
                 return
 
             log.info(
-                "[%s][DEBOUNCE] Чат %d: тишина 6 сек, включаем печать и ask_ai (%d частей)",
+                "[%s][DEBOUNCE] Чат %d: тишина выдержана, включаем печать и ask_ai (%d частей)",
                 self.name, chat_id, len(parts),
             )
             self._start_typing(chat_id)
