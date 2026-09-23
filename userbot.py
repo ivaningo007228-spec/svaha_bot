@@ -900,60 +900,117 @@ def _drop_trailing_sentence_marks(text: str) -> str:
     return trimmed.strip()
 
 
-def split_reply_chunks(text: str) -> list[str]:
+def _soften_internal_periods(text: str) -> str:
+    """Точка внутри фразы становится запятой, следующая буква — строчной."""
+    def repl(match: re.Match) -> str:
+        nxt = match.group(1) or ""
+        if not nxt:
+            return ","
+        return ", " + nxt.lower()
+
+    softened = re.sub(r"\.+\s*([A-Za-zА-Яа-яЁё])?", repl, text or "")
+    softened = softened.replace("!", "")
+    softened = re.sub(r"\s+,", ",", softened)
+    softened = re.sub(r",(?:\s*,)+", ",", softened)
+    softened = re.sub(r"\s+", " ", softened).strip()
+    return softened
+
+
+def _render_human_chunk(text: str, *, keep_trailing_comma: bool) -> str:
     """
-    Короткий ответ остаётся одним сообщением.
-    Длинный (больше 15 слов или 100 символов) режется по предложениям, запятым и союзам
-    на порции примерно по 7–12 слов.
+    В сообщении остаются только запятые и вопросы.
+    Точка на склейке монолога превращается в запятую, финальная точка и «!» стираются.
     """
-    cleaned = re.sub(r"\s+", " ", (text or "").strip())
-    if not cleaned:
+    body = re.sub(r"\s+", " ", (text or "").strip()).replace("!", "")
+    if not keep_trailing_comma:
+        body = body.rstrip().rstrip(".!")
+    body = _soften_internal_periods(body)
+    body = body.strip().rstrip(".!")
+    body = body.strip()
+    if keep_trailing_comma and body and not body.endswith("?"):
+        body = body.rstrip(",").strip()
+        if body:
+            body += ","
+    return body.strip()
+
+
+def _boundary_kind(prev: str, nxt: str) -> str | None:
+    if re.search(r"\.+$", prev):
+        return "period"
+    if prev.endswith("?") or prev.endswith(","):
+        return "soft"
+    if _word_core(nxt) in _REPLY_CONJUNCTIONS:
+        return "soft"
+    return None
+
+
+def _split_segment_pieces(segment: str) -> list[tuple[str, str]]:
+    """Режет один кусок между «!» на порции. Граница: period, soft или end."""
+    words = segment.split(" ")
+    if not words:
         return []
-    words = cleaned.split(" ")
-    if len(words) <= 15 and len(cleaned) <= 100:
-        short = _drop_trailing_sentence_marks(cleaned)
-        return [short] if short else []
+    if len(words) <= 15 and len(segment) <= 100:
+        return [(segment, "end")]
 
-    def boundary_before(index: int) -> bool:
-        if index <= 0 or index >= len(words):
-            return False
-        prev = words[index - 1]
-        if re.search(r"[.!?…]$", prev) or prev.endswith(","):
-            return True
-        return _word_core(words[index]) in _REPLY_CONJUNCTIONS
+    def find_cut(start: int, remaining: int) -> tuple[int, str]:
+        for kind in ("period", "soft"):
+            for count in range(12, 6, -1):
+                index = start + count
+                if index >= start + remaining:
+                    continue
+                found = _boundary_kind(words[index - 1], words[index])
+                if found == kind:
+                    return index, kind
+        for count in range(13, min(18, remaining)):
+            index = start + count
+            if _boundary_kind(words[index - 1], words[index]) == "period":
+                return index, "period"
+        return start + 12, "soft"
 
-    chunks: list[str] = []
+    pieces: list[tuple[str, str]] = []
     start = 0
     total = len(words)
     while start < total:
         remaining = total - start
         if remaining <= 12:
-            tail = _drop_trailing_sentence_marks(" ".join(words[start:]).strip(" ,"))
-            if tail:
-                chunks.append(tail)
+            pieces.append((" ".join(words[start:]), "end"))
             break
-        cut = None
-        for count in range(12, 6, -1):
-            index = start + count
-            if boundary_before(index):
-                cut = index
-                break
-        if cut is None:
-            for count in range(13, min(18, remaining)):
-                index = start + count
-                if boundary_before(index):
-                    cut = index
-                    break
-        if cut is None:
-            cut = start + 12
-        piece = _drop_trailing_sentence_marks(" ".join(words[start:cut]).strip(" ,"))
-        if piece:
-            chunks.append(piece)
+        cut, kind = find_cut(start, remaining)
+        piece_words = words[start:cut]
+        if kind == "period" and piece_words:
+            piece_words[-1] = piece_words[-1].rstrip(".")
+        pieces.append((" ".join(piece_words), kind))
         start = cut
-    if chunks:
-        return chunks
-    fallback = _drop_trailing_sentence_marks(cleaned)
-    return [fallback] if fallback else []
+    return pieces
+
+
+def split_reply_chunks(text: str) -> list[str]:
+    """
+    Живая нарезка.
+    «!» режет ответ на отдельные сообщения и сам стирается.
+    Длинный монолог по точке расходится на порции, а точка становится запятой.
+    В конце куска не остаётся «.» и «!», вопрос сохраняется.
+    """
+    cleaned = re.sub(r"\s+", " ", (text or "").replace("…", ".").strip())
+    if not cleaned:
+        return []
+
+    segments = [part.strip() for part in re.split(r"!+", cleaned) if part.strip()]
+    if not segments:
+        return []
+
+    chunks: list[str] = []
+    for seg_index, segment in enumerate(segments):
+        pieces = _split_segment_pieces(segment)
+        for piece_index, (body, boundary) in enumerate(pieces):
+            is_last = seg_index == len(segments) - 1 and piece_index == len(pieces) - 1
+            keep_comma = boundary == "period" and not is_last
+            human = _render_human_chunk(body, keep_trailing_comma=keep_comma)
+            human = human.strip().rstrip(".!")
+            human = human.strip()
+            if human:
+                chunks.append(human)
+    return chunks
 
 
 def choose_ping_phrase(now: datetime | None = None) -> tuple[str, str]:
