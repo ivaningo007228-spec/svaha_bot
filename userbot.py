@@ -447,6 +447,10 @@ log.info("Локальная модель ИИ успешно инициализ
 
 _AI_GEN_LOCK = asyncio.Lock()
 
+# Склейка мыслей собеседника: общие словари модуля
+pending_messages: dict[int, list[str]] = {}
+debouncer_tasks: dict[int, asyncio.Task] = {}
+
 # ── Векторная память диалогов (Qdrant + MiniLM на CPU) ─────────────────────
 QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
@@ -773,6 +777,24 @@ PING_PHRASES_DAY: list[str] = [
     "привет, как бодрячком?",
     "приветик, хорошего дня) чем занята?",
 ]
+
+
+def _collapse_trailing_user_burst(dialog_history: list[dict[str, str]], joined_text: str) -> None:
+    """Убирает хвост отдельных реплик, если они уже склеены в один входящий промпт."""
+    joined = (joined_text or "").strip()
+    if not joined or not dialog_history:
+        return
+    idx = len(dialog_history)
+    collected: list[str] = []
+    while idx > 0 and dialog_history[idx - 1].get("role") == "user":
+        collected.append(str(dialog_history[idx - 1].get("content") or "").strip())
+        idx -= 1
+        ordered = list(reversed(collected))
+        if "\n".join(ordered) == joined or " ".join(ordered) == joined:
+            del dialog_history[idx:]
+            return
+        if len(collected) > 12:
+            return
 
 
 def choose_ping_phrase(now: datetime | None = None) -> tuple[str, str]:
@@ -1137,6 +1159,10 @@ class AccountBot:
         self.night_mode_active: bool = False
         self.day_mode_event: asyncio.Event = asyncio.Event()
 
+        # Чаты этого аккаунта, чьи таски лежат в модульных pending_messages / debouncer_tasks
+        self._debounce_chat_ids: set[int] = set()
+        self.typing_activity: dict[int, float] = {}
+
         self._register_handlers()
 
     # ── Регистрация обработчиков сообщений и сырых обновлений ───────────────
@@ -1171,7 +1197,7 @@ class AccountBot:
             await self.handle_girl_message(message)
 
     async def handle_raw_update(self, update: raw.base.Update, users: dict, chats: dict) -> None:
-        """Диспетчер сырых обновлений MTProto. Отслеживает UpdatesTooLong и другие события."""
+        """Диспетчер сырых обновлений MTProto. Отслеживает UpdatesTooLong и статус печати."""
         update_name = type(update).__name__
         if isinstance(update, (raw.types.UpdatesTooLong, raw.types.UpdateChannelTooLong)):
             log.warning(
@@ -1179,6 +1205,16 @@ class AccountBot:
                 self.name,
                 update_name,
             )
+            return
+
+        if isinstance(update, raw.types.UpdateUserTyping):
+            user_id = int(update.user_id)
+            if isinstance(update.action, raw.types.SendMessageTypingAction):
+                self.typing_activity[user_id] = time.monotonic()
+                log.debug("[%s][TYPING] Пользователь %s печатает", self.name, user_id)
+            elif isinstance(update.action, raw.types.SendMessageCancelAction):
+                self.typing_activity.pop(user_id, None)
+                log.debug("[%s][TYPING] Пользователь %s перестал печатать", self.name, user_id)
 
     # ── Проверки активности и режима сна ───────────────────────────────────
 
@@ -1886,6 +1922,9 @@ class AccountBot:
             if msg_content and isinstance(msg_content, str) and msg_content.strip():
                 dialog_history.append({"role": msg_role, "content": msg_content.strip()})
 
+        # Склеенная мысль уже лежит в логе отдельными репликами — убираем хвост, чтобы не дублировать её
+        _collapse_trailing_user_burst(dialog_history, cleaned_user_text)
+
         # Убеждаемся, что текущее сообщение девушки с контекстом ответа является САМЫМ ПОСЛЕДНИМ в массиве
         if dialog_history and dialog_history[-1].get("role") == "user" and dialog_history[-1].get("content") == cleaned_user_text:
             dialog_history[-1]["content"] = effective_user_text
@@ -1932,7 +1971,9 @@ class AccountBot:
             return raw_text.replace("\n", " ").strip()
 
         try:
-            logger.info(f"[{self.name}] Запуск генерации ответа локальной моделью Qwen...")
+            logger.info(f"[{self.name}] Запуск генерации ответа локальной моделью Qwen в отдельном потоке...")
+            # model.generate блокирует поток, но не event loop: Pyrogram продолжает принимать сообщения.
+            # Лок не пускает вторую генерацию на ту же видеокарту.
             async with _AI_GEN_LOCK:
                 ai_text = await asyncio.to_thread(_sync_generate, prompt_text)
 
@@ -1955,11 +1996,12 @@ class AccountBot:
         chat_id: int | str,
         message: Message | None,
         assistant_reply: str,
+        user_text: str | None = None,
     ) -> None:
         """После успешной отправки ответа векторизует реплику девушки и пишет пару в Qdrant."""
-        if message is None:
-            return
-        user_message = (message.text or message.caption or "").strip()
+        user_message = (user_text or "").strip()
+        if not user_message and message is not None:
+            user_message = (message.text or message.caption or "").strip()
         if not user_message:
             return
         await save_dialog_memory(chat_id, user_message, assistant_reply)
@@ -1969,6 +2011,7 @@ class AccountBot:
         chat_id: int | str,
         reply: str,
         message: Message | None = None,
+        user_text: str | None = None,
     ) -> None:
         """Обработка ответа ИИ: парсинг маркеров, отправка и обновление Excel."""
         log.debug("[%s][PROCESS_REPLY] Начало обработки ответа ИИ для чата %s...", self.name, chat_id)
@@ -2050,7 +2093,7 @@ class AccountBot:
                 f"🔔 [{self.name}] Запись внесена в Excel. Клиент: {name} ({username})",
             )
             log.info("[%s][PROCESS_REPLY] Приглашение успешно зафиксировано для %s (%s)", self.name, name, username)
-            await self._remember_successful_reply(chat_id, message, invite_text)
+            await self._remember_successful_reply(chat_id, message, invite_text, user_text=user_text)
             return
 
         if reply:
@@ -2069,7 +2112,7 @@ class AccountBot:
                 "[%s][PROCESS_REPLY] Ответ успешно отправлен клиенту %s (reply_link=%s, msg_id=%s): '%s'",
                 self.name, chat_id, should_reply_link, reply_to_msg_id, reply[:60].replace("\n", " ")
             )
-            await self._remember_successful_reply(chat_id, message, reply)
+            await self._remember_successful_reply(chat_id, message, reply, user_text=user_text)
 
     # ── Логика задержки, прочтения истории и набора текста ───────────────────
 
@@ -2198,7 +2241,7 @@ class AccountBot:
 
             # Шаг 6. Отправка ответа клиенту
             log.info("[%s][REPLY_WORKER] Чат %d: Отправка ответа клиенту через process_ai_reply...", self.name, chat_id)
-            await self.process_ai_reply(chat_id, raw_reply, message=message)
+            await self.process_ai_reply(chat_id, raw_reply, message=message, user_text=text)
             log.info("[%s][REPLY_WORKER] Чат %d: Цикл ответа полностью завершен", self.name, chat_id)
 
         except asyncio.CancelledError:
@@ -2706,6 +2749,88 @@ class AccountBot:
         except Exception as exc:
             log.error("[%s][GREETING] Ошибка отправки приветствия клиенту %d: %s", self.name, target_user_id, exc)
 
+    def _peer_is_typing(self, chat_id: int) -> bool:
+        """True, если за последние 6 секунд приходило ChatAction.TYPING от этого пользователя."""
+        last_seen = self.typing_activity.get(chat_id)
+        if last_seen is None:
+            return False
+        return (time.monotonic() - last_seen) < 6.0
+
+    def _cancel_thought_debounce(self, chat_id: int, *, drop_pending: bool) -> None:
+        task = debouncer_tasks.get(chat_id)
+        if drop_pending:
+            pending_messages.pop(chat_id, None)
+            debouncer_tasks.pop(chat_id, None)
+            self._debounce_chat_ids.discard(chat_id)
+        if task and not task.done():
+            task.cancel()
+
+    def _queue_debounced_thought(self, chat_id: int, message: Message, msg_text: str) -> None:
+        """Сбрасывает старый таймер, копит текст и заново ждёт конец мысли."""
+        old_task = debouncer_tasks.get(chat_id)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+
+        pending_messages.setdefault(chat_id, []).append(msg_text)
+        self._debounce_chat_ids.add(chat_id)
+        task = asyncio.create_task(
+            self.wait_for_finishing_thought(chat_id, message),
+            name=f"debounce_{self.name}_{chat_id}",
+        )
+        debouncer_tasks[chat_id] = task
+        log.info(
+            "[%s][DEBOUNCE] Чат %d: в очереди %d частей мысли, таймер ожидания перезапущен",
+            self.name, chat_id, len(pending_messages[chat_id]),
+        )
+
+    async def wait_for_finishing_thought(self, chat_id: int, original_message: Message) -> None:
+        """
+        Ждёт, пока собеседница допишет мысль: 6 секунд тишины, затем ещё по 3 секунды,
+        пока приходят свежие события печати. Отмена не стирает накопленный текст.
+        """
+        current = asyncio.current_task()
+        try:
+            await asyncio.sleep(6)
+            while self._peer_is_typing(chat_id):
+                if debouncer_tasks.get(chat_id) is not current:
+                    return
+                log.info("[%s][DEBOUNCE] Чат %d всё ещё печатает, ждём ещё 3 сек", self.name, chat_id)
+                await asyncio.sleep(3)
+
+            if debouncer_tasks.get(chat_id) is not current or self._stop_event.is_set():
+                return
+            if self.is_ai_frozen():
+                log.info("[%s][DEBOUNCE] Чат %d: ИИ заморожен, собранную мысль не отправляем", self.name, chat_id)
+                pending_messages.pop(chat_id, None)
+                debouncer_tasks.pop(chat_id, None)
+                self._debounce_chat_ids.discard(chat_id)
+                return
+
+            parts = pending_messages.pop(chat_id, [])
+            debouncer_tasks.pop(chat_id, None)
+            self._debounce_chat_ids.discard(chat_id)
+            combined = "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+            if not combined:
+                return
+
+            log.info(
+                "[%s][DEBOUNCE] Чат %d: мысль собрана из %d сообщений, передаём в пайплайн Qwen",
+                self.name, chat_id, len(parts),
+            )
+            reply_task = asyncio.create_task(
+                self._delayed_reply(original_message, chat_id, combined),
+                name=f"reply_{self.name}_{chat_id}",
+            )
+            chat_info = self.active_chats.get(chat_id)
+            if chat_info is not None:
+                chat_info["reply_task"] = reply_task
+        except asyncio.CancelledError:
+            log.debug(
+                "[%s][DEBOUNCE] Чат %d: ожидание отменено новым сообщением, накопленный текст сохранён",
+                self.name, chat_id,
+            )
+            raise
+
     async def handle_girl_message(self, message: Message) -> None:
         """Перехват входящих сообщений (текстовых и медиа) от девушек / клиентов."""
         chat_id = message.chat.id
@@ -2814,7 +2939,8 @@ class AccountBot:
             self._append_to_history(chat_id, "user", history_entry)
             self.active_chats[chat_id]["last_msg_is_me"] = False
 
-            # Если для этого чата уже висит невыполненная задача ответа — отменяем её
+            # Медиа отвечает сразу: очередь текста и ожидание мысли больше не нужны
+            self._cancel_thought_debounce(chat_id, drop_pending=True)
             prev_reply_task: asyncio.Task | None = chat_info.get("reply_task")
             if prev_reply_task and not prev_reply_task.done():
                 prev_reply_task.cancel()
@@ -2835,16 +2961,13 @@ class AccountBot:
         self._append_to_history(chat_id, "user", msg_text)
         self.active_chats[chat_id]["last_msg_is_me"] = False
 
-        # Если для этого чата уже висит невыполненная задача ответа — отменяем её, чтобы не спамить
+        # Если ответ уже генерируется, обрываем его: пришла ещё одна часть мысли
         prev_reply_task: asyncio.Task | None = chat_info.get("reply_task")
         if prev_reply_task and not prev_reply_task.done():
             prev_reply_task.cancel()
             log.debug("[%s][GIRL_MSG] Отменена предыдущая задача ответа для чата %d в пользу более свежего сообщения", self.name, chat_id)
 
-        # Запускаем отложенный ответ параллельно, чтобы не блокировать воркер Pyrogram
-        log.info("[%s][GIRL_MSG] Запуск фоновой задачи отложенного ответа для чата %d...", self.name, chat_id)
-        reply_task = asyncio.create_task(self._delayed_reply(message, chat_id, msg_text))
-        chat_info["reply_task"] = reply_task
+        self._queue_debounced_thought(chat_id, message, msg_text)
 
     # ── Фоновые задачи аккаунта ─────────────────────────────────────────────
 
@@ -3017,7 +3140,7 @@ class AccountBot:
         self._append_to_history(user_id, "assistant", phrase)
         await save_dialog_memory(
             user_id,
-            "Ваня сам проявил инициативу",
+            "Инициатива Вани",
             phrase,
             embed_text=phrase,
             initiative=True,
@@ -3356,6 +3479,13 @@ class AccountBot:
                 await self.day_worker_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        for chat_id in list(self._debounce_chat_ids):
+            task = debouncer_tasks.pop(chat_id, None)
+            pending_messages.pop(chat_id, None)
+            if task and not task.done():
+                task.cancel()
+        self._debounce_chat_ids.clear()
 
         if self.client and self.client.is_connected:
             try:
