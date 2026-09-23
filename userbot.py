@@ -1487,9 +1487,12 @@ class AccountBot:
 
         if isinstance(update, raw.types.UpdateUserTyping):
             user_id = int(update.user_id)
+            if user_id == self.my_id:
+                return
             if isinstance(update.action, raw.types.SendMessageTypingAction):
                 self.typing_activity[user_id] = time.monotonic()
                 log.debug("[%s][TYPING] Пользователь %s печатает", self.name, user_id)
+                self._interrupt_writer_for_peer_typing(user_id)
             elif isinstance(update.action, raw.types.SendMessageCancelAction):
                 self.typing_activity.pop(user_id, None)
                 log.debug("[%s][TYPING] Пользователь %s перестал печатать", self.name, user_id)
@@ -3310,15 +3313,21 @@ class AccountBot:
 
     async def _typing_loop(self, chat_id: int) -> None:
         stop = self._typing_stop.get(chat_id)
-        while stop is not None and not stop.is_set():
-            try:
-                await self.client.send_chat_action(chat_id, enums.ChatAction.TYPING)
-            except Exception as exc:
-                log.debug("[%s][DEBOUNCE] Не удалось показать TYPING в чате %d: %s", self.name, chat_id, exc)
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=4.0)
-            except asyncio.TimeoutError:
-                pass
+        try:
+            while stop is not None and not stop.is_set():
+                try:
+                    await self.client.send_chat_action(chat_id, enums.ChatAction.TYPING)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.debug("[%s][DEBOUNCE] Не удалось показать TYPING в чате %d: %s", self.name, chat_id, exc)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=4.0)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            log.debug("[%s][DEBOUNCE] Чат %d: цикл печати Вани отменён", self.name, chat_id)
+            raise
 
     def _stop_typing(self, chat_id: int) -> None:
         stop = self._typing_stop.pop(chat_id, None)
@@ -3345,8 +3354,48 @@ class AccountBot:
     async def _send_typing_cancel(self, chat_id: int) -> None:
         try:
             await self.client.send_chat_action(chat_id, enums.ChatAction.CANCEL)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             log.debug("[%s][DEBOUNCE] Не удалось снять TYPING в чате %d: %s", self.name, chat_id, exc)
+
+    async def _go_offline(self) -> None:
+        """Сбрасывает онлайн, когда Ваня замолкает и ждёт её сообщение."""
+        try:
+            await self.client.invoke(raw.functions.account.UpdateStatus(offline=True))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("[%s][DEBOUNCE] Не удалось уйти в офлайн: %s", self.name, exc)
+
+    def _other_presence_alive(self, chat_id: int) -> bool:
+        for bucket in (self._listen_tasks, self._typing_tasks):
+            for other_id, task in bucket.items():
+                if other_id != chat_id and task is not None and not task.done():
+                    return True
+        return False
+
+    def _interrupt_writer_for_peer_typing(self, chat_id: int) -> None:
+        """
+        Девушка начала печатать, пока Ваня набирает или досылает паузу.
+        Гасим TYPING, отменяем досыл готового ответа и ждём её сообщение.
+        """
+        if not self._writer_active(chat_id):
+            return
+        log.info(
+            "[%s][TYPING] Чат %d: девушка печатает, Ваня сразу гасит набор и ждёт",
+            self.name, chat_id,
+        )
+        self._silence_writer(chat_id)
+        thought = debouncer_tasks.get(chat_id)
+        if thought is not None and not thought.done():
+            thought.cancel()
+        self._stop_listener(chat_id)
+        if not self._other_presence_alive(chat_id):
+            asyncio.create_task(
+                self._go_offline(),
+                name=f"offline_{self.name}_{chat_id}",
+            )
 
     def _cancel_thought_debounce(self, chat_id: int, *, drop_pending: bool) -> None:
         task = debouncer_tasks.get(chat_id)
@@ -3460,10 +3509,23 @@ class AccountBot:
             remaining = target_delay - elapsed
             if remaining > 0:
                 log.info(
-                    "[%s][DEBOUNCE] Чат %d: ответ готов за %.1f с, досыпаем %.1f с в статусе печати",
+                    "[%s][DEBOUNCE] Чат %d: ответ готов за %.1f с, досыпаем %.1f с, пока она не печатает",
                     self.name, chat_id, elapsed, remaining,
                 )
-                await asyncio.sleep(remaining)
+            while remaining > 0:
+                if self._peer_is_typing(chat_id):
+                    log.info(
+                        "[%s][DEBOUNCE] Чат %d: ответ готов, но девушка печатает — досыл сброшен",
+                        self.name, chat_id,
+                    )
+                    self._silence_writer(chat_id)
+                    self._stop_listener(chat_id)
+                    return
+                if debouncer_tasks.get(chat_id) is not current or self._stop_event.is_set():
+                    return
+                step = min(0.4, remaining)
+                await asyncio.sleep(step)
+                remaining -= step
             if debouncer_tasks.get(chat_id) is not current or self._stop_event.is_set():
                 return
 
