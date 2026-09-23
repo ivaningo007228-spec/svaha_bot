@@ -894,6 +894,12 @@ def _word_core(word: str) -> str:
 _REPLY_CONJUNCTIONS = {"и", "а", "но", "или", "либо", "что", "чтобы", "если", "когда", "хотя", "потому"}
 
 
+def _drop_trailing_sentence_marks(text: str) -> str:
+    """Убирает точки и восклицательные знаки только в конце строки. Вопросы не трогает."""
+    trimmed = (text or "").strip().rstrip(".!")
+    return trimmed.strip()
+
+
 def split_reply_chunks(text: str) -> list[str]:
     """
     Короткий ответ остаётся одним сообщением.
@@ -905,7 +911,8 @@ def split_reply_chunks(text: str) -> list[str]:
         return []
     words = cleaned.split(" ")
     if len(words) <= 15 and len(cleaned) <= 100:
-        return [cleaned]
+        short = _drop_trailing_sentence_marks(cleaned)
+        return [short] if short else []
 
     def boundary_before(index: int) -> bool:
         if index <= 0 or index >= len(words):
@@ -921,7 +928,7 @@ def split_reply_chunks(text: str) -> list[str]:
     while start < total:
         remaining = total - start
         if remaining <= 12:
-            tail = " ".join(words[start:]).strip(" ,")
+            tail = _drop_trailing_sentence_marks(" ".join(words[start:]).strip(" ,"))
             if tail:
                 chunks.append(tail)
             break
@@ -939,11 +946,14 @@ def split_reply_chunks(text: str) -> list[str]:
                     break
         if cut is None:
             cut = start + 12
-        piece = " ".join(words[start:cut]).strip(" ,")
+        piece = _drop_trailing_sentence_marks(" ".join(words[start:cut]).strip(" ,"))
         if piece:
             chunks.append(piece)
         start = cut
-    return chunks or [cleaned]
+    if chunks:
+        return chunks
+    fallback = _drop_trailing_sentence_marks(cleaned)
+    return [fallback] if fallback else []
 
 
 def choose_ping_phrase(now: datetime | None = None) -> tuple[str, str]:
@@ -2407,7 +2417,11 @@ class AccountBot:
         task_key = chat_id
         self._chunk_tasks[task_key] = asyncio.current_task()
         try:
-            for index, chunk in enumerate(chunks):
+            for index, raw_chunk in enumerate(chunks):
+                chunk = _drop_trailing_sentence_marks(raw_chunk)
+                if not chunk:
+                    log.info("[%s][PROCESS_REPLY] Чат %s: кусок %d пуст после очистки, пропуск", self.name, chat_id, index + 1)
+                    continue
                 typing_for = min(5.0, max(2.0, len(chunk) * 0.05))
                 log.info(
                     "[%s][PROCESS_REPLY] Чат %s: печать %.1f с, кусок %d/%d",
@@ -2547,7 +2561,10 @@ class AccountBot:
                 if len(chunks) > 1:
                     await self._send_reply_chunks(chat_id, chunks, reply_to_msg_id if should_reply_link else None)
                 else:
-                    text = chunks[0] if chunks else reply
+                    text = _drop_trailing_sentence_marks(chunks[0] if chunks else reply)
+                    if not text:
+                        log.info("[%s][PROCESS_REPLY] Чат %s: после очистки финала отправлять нечего", self.name, chat_id)
+                        return
                     try:
                         if should_reply_link and reply_to_msg_id:
                             await self.client.send_message(chat_id, text, reply_to_message_id=reply_to_msg_id)
