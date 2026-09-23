@@ -16,9 +16,13 @@ import random
 import re
 import sys
 import time
+import uuid
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from peft import PeftModel
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http import models as qmodels
+from sentence_transformers import SentenceTransformer
 
 # Поддержка UTF-8 вывода в консоли Windows
 if sys.platform.startswith("win"):
@@ -442,6 +446,188 @@ ai_model.eval()
 log.info("Локальная модель ИИ успешно инициализирована и готова к работе!")
 
 _AI_GEN_LOCK = asyncio.Lock()
+
+# ── Векторная память диалогов (Qdrant + MiniLM на CPU) ─────────────────────
+QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
+EMBEDDING_MODEL_NAME: str = os.getenv(
+    "EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
+)
+QDRANT_COLLECTION: str = "vanya_memories"
+QDRANT_VECTOR_SIZE: int = 384
+
+qdrant_client: AsyncQdrantClient | None = None
+embed_model: SentenceTransformer | None = None
+_memory_ready: bool = False
+_memory_lock: asyncio.Lock | None = None
+
+
+def _coerce_chat_id(chat_id: int | str) -> int:
+    """Приводит chat_id к int, чтобы фильтр Qdrant совпадал с payload."""
+    text = str(chat_id).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    raise ValueError(f"chat_id не является числом: {chat_id}")
+
+
+def _embed_text_sync(text: str) -> list[float]:
+    """Синхронный эмбеддинг на CPU. Вызывается через asyncio.to_thread."""
+    if embed_model is None:
+        raise RuntimeError("Модель эмбеддингов не загружена")
+    vector = embed_model.encode(
+        text,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+    return vector.tolist()
+
+
+async def init_vector_memory() -> None:
+    """
+    Один раз при старте юзербота:
+    - поднимает AsyncQdrantClient к localhost:6333;
+    - создаёт коллекцию vanya_memories (384, Cosine), если её ещё нет;
+    - грузит SentenceTransformer all-MiniLM-L6-v2 строго на CPU.
+    """
+    global qdrant_client, embed_model, _memory_ready, _memory_lock
+
+    if _memory_lock is None:
+        _memory_lock = asyncio.Lock()
+
+    async with _memory_lock:
+        if _memory_ready:
+            return
+
+        log.info(
+            "[QDRANT] Подключение к %s:%s, коллекция '%s'...",
+            QDRANT_HOST, QDRANT_PORT, QDRANT_COLLECTION,
+        )
+        qdrant_client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+        if not await qdrant_client.collection_exists(QDRANT_COLLECTION):
+            await qdrant_client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=qmodels.VectorParams(
+                    size=QDRANT_VECTOR_SIZE,
+                    distance=qmodels.Distance.COSINE,
+                ),
+            )
+            log.info("[QDRANT] Коллекция '%s' создана (size=384, distance=Cosine)", QDRANT_COLLECTION)
+        else:
+            log.info("[QDRANT] Коллекция '%s' уже существует", QDRANT_COLLECTION)
+
+        try:
+            await qdrant_client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name="chat_id",
+                field_schema=qmodels.PayloadSchemaType.INTEGER,
+            )
+        except Exception as index_exc:
+            log.debug("[QDRANT] Индекс chat_id уже есть или не создан: %s", index_exc)
+
+        log.info("[QDRANT] Загрузка эмбеддера %s на CPU...", EMBEDDING_MODEL_NAME)
+        embed_model = await asyncio.to_thread(
+            SentenceTransformer, EMBEDDING_MODEL_NAME, device="cpu"
+        )
+        _memory_ready = True
+        log.info("[QDRANT] Векторная память готова (эмбеддер на CPU, VRAM не занята)")
+
+
+async def close_vector_memory() -> None:
+    """Закрыть HTTP-клиент Qdrant при остановке юзербота."""
+    global qdrant_client, _memory_ready
+    if qdrant_client is not None:
+        try:
+            await qdrant_client.close()
+        except Exception as exc:
+            log.debug("[QDRANT] Ошибка закрытия клиента: %s", exc)
+        qdrant_client = None
+    _memory_ready = False
+
+
+async def recall_dialog_memories(chat_id: int | str, user_text: str, limit: int = 3) -> str:
+    """
+    RAG: векторизует новое сообщение девушки и достаёт 2–3 похожие прошлые пары
+    строго из этого chat_id.
+    """
+    cleaned = (user_text or "").strip()
+    if not _memory_ready or qdrant_client is None or not cleaned:
+        return ""
+
+    try:
+        numeric_chat_id = _coerce_chat_id(chat_id)
+    except ValueError:
+        return ""
+
+    try:
+        vector = await asyncio.to_thread(_embed_text_sync, cleaned)
+        query_filter = qmodels.Filter(
+            must=[
+                qmodels.FieldCondition(
+                    key="chat_id",
+                    match=qmodels.MatchValue(value=numeric_chat_id),
+                )
+            ]
+        )
+        # qdrant-client 1.19 убрал search(); query_points — тот же nearest-поиск по вектору.
+        response = await qdrant_client.query_points(
+            collection_name=QDRANT_COLLECTION,
+            query=vector,
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True,
+        )
+        hits = response.points
+    except Exception as exc:
+        log.warning("[QDRANT] Поиск памяти для чата %s не удался: %s", chat_id, exc)
+        return ""
+
+    lines: list[str] = []
+    for hit in hits or []:
+        payload = getattr(hit, "payload", None) or {}
+        user_message = str(payload.get("user_message") or "").strip()
+        assistant_reply = str(payload.get("assistant_reply") or "").strip()
+        if not user_message or not assistant_reply:
+            continue
+        lines.append(f"[User: {user_message} / Assistant: {assistant_reply}]")
+
+    if not lines:
+        return ""
+
+    block = "Контекст прошлых бесед с этим собеседником:\n" + "\n".join(lines)
+    log.info("[QDRANT] Для чата %s подмешано %d воспоминаний в системный промпт", chat_id, len(lines))
+    return block
+
+
+async def save_dialog_memory(chat_id: int | str, user_message: str, assistant_reply: str) -> None:
+    """Сохраняет успешную пару «сообщение девушки → ответ Вани» в Qdrant."""
+    user_message = (user_message or "").strip()
+    assistant_reply = (assistant_reply or "").strip()
+    if not _memory_ready or qdrant_client is None or not user_message or not assistant_reply:
+        return
+
+    try:
+        numeric_chat_id = _coerce_chat_id(chat_id)
+        vector = await asyncio.to_thread(_embed_text_sync, user_message)
+        point = qmodels.PointStruct(
+            id=str(uuid.uuid4()),
+            vector=vector,
+            payload={
+                "chat_id": numeric_chat_id,
+                "user_message": user_message,
+                "assistant_reply": assistant_reply,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        await qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=[point])
+        log.info(
+            "[QDRANT] Память сохранена для чата %s: '%s' → '%s'",
+            numeric_chat_id,
+            user_message[:40].replace("\n", " "),
+            assistant_reply[:40].replace("\n", " "),
+        )
+    except Exception as exc:
+        log.warning("[QDRANT] Не удалось сохранить память чата %s: %s", chat_id, exc)
 
 # ── Настройки Автолайкера Дайвинчика (@leomatchbot) ──
 AUTOCLICKER_ENABLED: bool = False
@@ -1594,6 +1780,11 @@ class AccountBot:
         # 1. Системный промпт с динамическим временем и блоком "Контекст собеседника" из Excel
         system_prompt = _build_system_prompt(client_row, name=name)
 
+        # 1.1. RAG: похожие прошлые пары этой девушки из Qdrant — в начало системного контекста
+        memory_block = await recall_dialog_memories(user_id, str(user_text))
+        if memory_block:
+            system_prompt = f"{memory_block}\n\n{system_prompt}"
+
         # 2. Скользящее окно контекста: считываем ТОЛЬКО последние 10-15 сообщений из logs_chats/{user_id}.txt
         history = await self.read_chat_log_window(user_id, limit=15)
         if not history:
@@ -1714,6 +1905,20 @@ class AccountBot:
         """Алиас для ask_ai: генерация текста локальной моделью Qwen."""
         return await self.ask_ai(user_id, user_text, message=message)
 
+    async def _remember_successful_reply(
+        self,
+        chat_id: int | str,
+        message: Message | None,
+        assistant_reply: str,
+    ) -> None:
+        """После успешной отправки ответа векторизует реплику девушки и пишет пару в Qdrant."""
+        if message is None:
+            return
+        user_message = (message.text or message.caption or "").strip()
+        if not user_message:
+            return
+        await save_dialog_memory(chat_id, user_message, assistant_reply)
+
     async def process_ai_reply(
         self,
         chat_id: int | str,
@@ -1800,6 +2005,7 @@ class AccountBot:
                 f"🔔 [{self.name}] Запись внесена в Excel. Клиент: {name} ({username})",
             )
             log.info("[%s][PROCESS_REPLY] Приглашение успешно зафиксировано для %s (%s)", self.name, name, username)
+            await self._remember_successful_reply(chat_id, message, invite_text)
             return
 
         if reply:
@@ -1818,6 +2024,7 @@ class AccountBot:
                 "[%s][PROCESS_REPLY] Ответ успешно отправлен клиенту %s (reply_link=%s, msg_id=%s): '%s'",
                 self.name, chat_id, should_reply_link, reply_to_msg_id, reply[:60].replace("\n", " ")
             )
+            await self._remember_successful_reply(chat_id, message, reply)
 
     # ── Логика задержки, прочтения истории и набора текста ───────────────────
 
@@ -3140,6 +3347,11 @@ async def main() -> None:
         AUTOLIKE_DAILY_LIMIT,
     )
 
+    try:
+        await init_vector_memory()
+    except Exception as memory_exc:
+        log.error("[QDRANT] Память недоступна, юзербот продолжит без RAG: %s", memory_exc, exc_info=True)
+
     account_bots = [AccountBot(name) for name in ACCOUNTS]
 
     # Цикл, который с помощью asyncio.create_task() одновременно запускает метод start() и idle() для каждого аккаунта
@@ -3159,6 +3371,7 @@ async def main() -> None:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await close_vector_memory()
         log.info("Все аккаунты успешно остановлены. Завершение работы программы.")
 
 
