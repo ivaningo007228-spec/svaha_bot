@@ -1,8 +1,8 @@
 """
 Telegram Userbot — Мультиаккаунтная CRM-автоматизация поддержки клиентов
-Pyrogram + Локальная модель Qwen (Transformers + QLoRA 4-bit) + openpyxl + Умный автолайкер Дайвинчика
+Pyrogram + локальная Ollama (vanya_q5) + openpyxl + Умный автолайкер Дайвинчика
 
-Зависимости: pyrogram, tgcrypto, openpyxl, torch, transformers, peft, bitsandbytes, python-dotenv
+Зависимости: pyrogram, tgcrypto, openpyxl, ollama, python-dotenv
 """
 
 import asyncio
@@ -17,9 +17,7 @@ import re
 import sys
 import time
 import uuid
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from peft import PeftModel
+from ollama import AsyncClient
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
 from sentence_transformers import SentenceTransformer
@@ -413,39 +411,24 @@ async def _patched_handle_updates(self, updates):
 
 Client.handle_updates = _patched_handle_updates
 
-# ── Настройки ИИ (Прямая загрузка Transformers + LoRA в 4-bit) ──────────────
-BASE_MODEL: str = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
-ADAPTER_PATH: str = os.getenv("ADAPTER_PATH", "./vanya_lora_weights")
-if not Path(ADAPTER_PATH).resolve().exists() and (BASE_DIR / "vanya_lora_weights").exists():
-    ADAPTER_PATH = str(BASE_DIR / "vanya_lora_weights")
+# ── Настройки ИИ (локальная Ollama, без загрузки весов в процесс бота) ──────
+OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "vanya_q5")
+# Штраф выше ~1.1 заставляет Qwen бросать кириллицу и срываться в иероглифы.
+OLLAMA_TEMPERATURE: float = 0.45
+OLLAMA_REPEAT_PENALTY: float = 1.08
 
-log.info("Настройка BitsAndBytesConfig (4-bit NF4)...")
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-)
 
-log.info("Загрузка токенизатора из %s...", ADAPTER_PATH)
-tokenizer = AutoTokenizer.from_pretrained(ADAPTER_PATH, trust_remote_code=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-log.info("Загрузка базовой модели %s в 4-битном режиме (NF4)...", BASE_MODEL)
-base_model = AutoModelForCausalLM.from_pretrained(
-    BASE_MODEL,
-    quantization_config=bnb_config,
-    device_map="auto",
-    trust_remote_code=True,
-)
-
-log.info("Наложение LoRA-адаптера речи из %s...", ADAPTER_PATH)
-ai_model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
-ai_model.eval()
-log.info("Локальная модель ИИ успешно инициализирована и готова к работе!")
-
-_AI_GEN_LOCK = asyncio.Lock()
+def _ollama_message_text(response: object) -> str:
+    """Достаёт текст ответа Ollama и схлопывает переносы, как раньше делал декодер."""
+    message = getattr(response, "message", None)
+    if message is None and isinstance(response, dict):
+        message = response.get("message")
+    if isinstance(message, dict):
+        content = message.get("content") or ""
+    else:
+        content = getattr(message, "content", "") or ""
+    return str(content).replace("\n", " ").strip()
 
 # Склейка мыслей собеседника: общие словари модуля
 pending_messages: dict[int, list[str]] = {}
@@ -1027,7 +1010,45 @@ else:
 
 UPDATE_MARKER_PREFIX: str = (os.getenv("UPDATE_MARKER_PREFIX") or "ОБНОВИТЬ_ДАННЫЕ:").strip()
 
-DEFAULT_SYSTEM_PROMPT = """\
+RUSSIAN_LANGUAGE_LOCK = (
+    "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ КИТАЙСКИЕ ИЕРОГЛИФЫ ИЛИ АНГЛИЙСКИЙ ЯЗЫК. "
+    "ТЫ ОБЩАЕШЬСЯ СТРОГО НА РУССКОМ ЯЗЫКЕ. "
+    "ВСЕ СЛОВА, ВЫРАЖЕНИЯ И МЫСЛИ ДОЛЖНЫ БЫТЬ НАПИСАНЫ ИСКЛЮЧИТЕЛЬНО КИРИЛЛИЦЕЙ, "
+    "КАК У ОБЫЧНОГО РУССКОГО ПАРНЯ. "
+    "ЕСЛИ ТЫ ПОПЫТАЕШЬСЯ СГЕНЕРИРОВАТЬ ИЕРОГЛИФ, ДИАЛОГ БУДЕТ УНИЧТОЖЕН"
+)
+
+_HAN_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _contains_han(text: str) -> bool:
+    """Есть ли в строке хотя бы один китайский иероглиф."""
+    return bool(_HAN_RE.search(text or ""))
+
+
+def _strip_han(text: str) -> str:
+    """Убирает иероглифы и оставляет остальной текст."""
+    cleaned = _HAN_RE.sub(" ", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.strip(" ,;:-")
+
+
+def _seal_russian_prompt(prompt: str) -> str:
+    """Ставит языковой замок в самое начало и в самый конец системного промпта."""
+    lock = RUSSIAN_LANGUAGE_LOCK
+    body = (prompt or "").strip()
+    while body.startswith(lock):
+        body = body[len(lock):].strip()
+    while body.endswith(lock):
+        body = body[: -len(lock)].strip()
+    if not body:
+        return f"{lock}\n\n{lock}"
+    return f"{lock}\n\n{body}\n\n{lock}"
+
+
+DEFAULT_SYSTEM_PROMPT = f"""\
+{RUSSIAN_LANGUAGE_LOCK}
+
 Ты — 17-летний парень по имени Иван (Ваня). Твоя цель — вести живой, естественный и позитивный диалог с девушкой, с которой у тебя совпал лайк в Дайвинчике, общаться легко, непринужденно и плавно подводить к встрече.
 
 ТВОЯ ЛИЧНОСТЬ (ИНФОРМАЦИЯ О СЕБЕ):
@@ -1067,6 +1088,8 @@ DEFAULT_SYSTEM_PROMPT = """\
    - 'можно как-нибудь выбраться) я прикину по времени и скажу точно'
    Придумывай похожие живые варианты, не пиши всегда одно и то же.
 2. В самый конец этого сообщения (после текста ответа) принудительно допиши скрытый маркер: МАРКЕР_ПРИГЛАШЕНИЕ
+
+{RUSSIAN_LANGUAGE_LOCK}
 """
 
 def _load_system_prompt() -> str:
@@ -1075,7 +1098,7 @@ def _load_system_prompt() -> str:
     if env_sp:
         if "\\n" in env_sp and "\n" not in env_sp:
             env_sp = env_sp.replace("\\n", "\n")
-        return env_sp.strip('"').strip("'")
+        return _seal_russian_prompt(env_sp.strip('"').strip("'"))
 
     # Резервный поиск напрямую в файле .env, если dotenv споткнулся о внутренние кавычки
     env_path = Path(__file__).resolve().parent / ".env"
@@ -1091,10 +1114,10 @@ def _load_system_prompt() -> str:
                 if val:
                     if "\\n" in val and "\n" not in val:
                         val = val.replace("\\n", "\n")
-                    return val
+                    return _seal_russian_prompt(val)
         except Exception:
             pass
-    return DEFAULT_SYSTEM_PROMPT
+    return _seal_russian_prompt(DEFAULT_SYSTEM_PROMPT)
 
 
 SYSTEM_PROMPT: str = _load_system_prompt()
@@ -1265,7 +1288,7 @@ def prepare_messages_for_chat_template(
     system_prompt: str | None = None,
 ) -> list[dict[str, str]]:
     """
-    Формирует список сообщений для tokenizer.apply_chat_template.
+    Формирует список сообщений для Ollama chat.
     Гарантирует, что самый первый элемент ВСЕГДА имеет ровно такой вид:
     {"role": "system", "content": ...}.
     """
@@ -2134,20 +2157,21 @@ class AccountBot:
         )
         return missing
 
-    # ── Генерация ответа ИИ (Локальная модель Transformers + LoRA) ──────────
+    # ── Генерация ответа ИИ (локальная Ollama, без блокировки event loop) ────
 
     async def ask_ai(
         self,
         user_id: int | str,
         user_text: str,
         message: Message | None = None,
+        temperature: float = OLLAMA_TEMPERATURE,
     ) -> str:
         """
-        Генерация ответа ИИ напрямую через локальную модель Transformers + LoRA (без Ollama).
-        Берет контекст собеседника из Excel и скользящее окно (10-15 сообщений) из текстового лога.
-        Поддерживает распознавание ответов на сообщения (Reply) с передачей контекста цитируемой реплики.
+        Генерация ответа через локальную Ollama (модель vanya_q5).
+        Контекст собеседника берётся из Excel, Qdrant и скользящего окна переписки.
+        Отмена задачи не превращается в пустую строку: Debouncer ловит CancelledError.
         """
-        log.info("[%s][AI] Запрос к локальной модели для user_id=%s. Текст: '%s'", self.name, user_id, user_text[:60].replace("\n", " "))
+        log.info("[%s][AI] Запрос в Ollama для user_id=%s. Текст: '%s'", self.name, user_id, user_text[:60].replace("\n", " "))
         chat_data = self.active_chats.get(user_id) or self.active_chats.get(str(user_id), {})
 
         username = chat_data.get("username")
@@ -2177,6 +2201,9 @@ class AccountBot:
             slot = missing_slots[0]
             system_prompt = f"{system_prompt}\n\n{build_slot_goal(slot)}"
             log.info("[%s][SLOTS] Чат %s: тактическая цель — %s", self.name, user_id, slot)
+
+        # Языковой замок остаётся первой и последней фразой, даже после RAG и цели слота.
+        system_prompt = _seal_russian_prompt(system_prompt)
 
         # 2. Скользящее окно контекста: считываем ТОЛЬКО последние 10-15 сообщений из logs_chats/{user_id}.txt
         history = await self.read_chat_log_window(user_id, limit=15)
@@ -2222,7 +2249,7 @@ class AccountBot:
                 sender_label = "сообщение Вани" if is_reply_to_vanya else "сообщение собеседника"
                 effective_user_text = f'[Ответ на {sender_label}: "{replied_text}"] Входящее сообщение девушки: "{cleaned_user_text}"'
                 log.info(
-                    "[%s][AI] Обнаружен Reply от девушки на %s! Сформирован контекст для Qwen: '%s'",
+                    "[%s][AI] Обнаружен Reply от девушки на %s! Сформирован контекст для Ollama: '%s'",
                     self.name, sender_label, effective_user_text[:120]
                 )
 
@@ -2251,60 +2278,94 @@ class AccountBot:
             self.name, len(messages), len(messages) - 1, messages[-1]["role"], messages[-1]["content"][:60]
         )
 
-        # 4. Формируем текст через tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        prompt_text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        def _sync_generate(prompt: str) -> str:
-            inputs = tokenizer(prompt, return_tensors="pt")
-            target_device = next(ai_model.parameters()).device
-            inputs = {k: v.to(target_device) for k, v in inputs.items()}
-            input_len = inputs["input_ids"].shape[-1]
-
-            with torch.inference_mode():
-                output_ids = ai_model.generate(
-                    **inputs,
-                    max_new_tokens=96,
-                    temperature=0.4,
-                    top_p=0.9,
-                    top_k=50,
-                    do_sample=True,
-                    repetition_penalty=1.18,
-                    pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-
-            new_tokens = output_ids[0][input_len:]
-            raw_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-            # Очищаем ответ от переносов строк (.replace("\n", " ").strip())
-            return raw_text.replace("\n", " ").strip()
-
+        # 4. Асинхронный запрос в Ollama. Event loop Pyrogram в это время свободен.
+        client = AsyncClient(host=os.getenv("OLLAMA_HOST", OLLAMA_HOST))
         try:
-            logger.info(f"[{self.name}] Запуск генерации ответа локальной моделью Qwen в отдельном потоке...")
-            # model.generate блокирует поток, но не event loop: Pyrogram продолжает принимать сообщения.
-            # Лок не пускает вторую генерацию на ту же видеокарту.
-            async with _AI_GEN_LOCK:
-                ai_text = await asyncio.to_thread(_sync_generate, prompt_text)
-
-            logger.info(
-                "[%s][AI] Успешный ответ от локальной модели для %s (длина: %d симв.): '%s'",
+            log.info("[%s][AI] Запрос в Ollama, модель %s", self.name, os.getenv("OLLAMA_MODEL", OLLAMA_MODEL))
+            response = await client.chat(
+                model=os.getenv("OLLAMA_MODEL", OLLAMA_MODEL),
+                messages=messages,
+                options={
+                    "temperature": temperature,
+                    "top_p": 0.9,
+                    "top_k": 50,
+                    "repeat_penalty": OLLAMA_REPEAT_PENALTY,
+                    "num_predict": 96,
+                },
+            )
+            ai_text = _ollama_message_text(response)
+            log.info(
+                "[%s][AI] Успешный ответ от Ollama для %s (длина: %d симв.): '%s'",
                 self.name, user_id, len(ai_text), ai_text[:60]
             )
             return ai_text
         except asyncio.CancelledError:
-            logger.info("[%s][AI] Генерация для %s отменена: собеседница дописала мысль", self.name, user_id)
+            log.info("[%s][AI] Генерация для %s отменена: собеседница дописала мысль", self.name, user_id)
             raise
         except Exception as e:
-            logger.error(f"[{self.name}] Критическая ошибка локальной генерации: {e}", exc_info=True)
+            log.error("[%s] Критическая ошибка запроса в Ollama: %s", self.name, e, exc_info=True)
             print(f"[{self.name}][DEBUG ИИ] Критическая ошибка генерации: {e}")
             return ""
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                log.debug("[%s][AI] Клиент Ollama уже закрыт", self.name)
 
-    async def generate_text(self, user_id: int | str, user_text: str, message: Message | None = None) -> str:
-        """Алиас для ask_ai: генерация текста локальной моделью Qwen."""
-        return await self.ask_ai(user_id, user_text, message=message)
+    async def generate_text(
+        self,
+        user_id: int | str,
+        user_text: str,
+        message: Message | None = None,
+        temperature: float = OLLAMA_TEMPERATURE,
+    ) -> str:
+        """Алиас для ask_ai: генерация текста через локальную Ollama."""
+        return await self.ask_ai(user_id, user_text, message=message, temperature=temperature)
+
+    async def _guard_russian_reply(
+        self,
+        chat_id: int | str,
+        reply: str,
+        message: Message | None,
+        user_text: str | None,
+    ) -> str:
+        """
+        Перед отправкой в Telegram: если в ответе есть иероглиф, один раз
+        перегенерировать его с температурой на 0.1 ниже. Повторный сбой —
+        вырезать иероглифы и оставить русскую часть.
+        """
+        if not _contains_han(reply):
+            return reply
+
+        reroll_temp = max(0.1, OLLAMA_TEMPERATURE - 0.1)
+        log.warning(
+            "[%s][AI] В ответе для %s найдены иероглифы, повтор генерации с температурой %.2f",
+            self.name, chat_id, reroll_temp,
+        )
+        source = (user_text or "").strip()
+        if not source and message is not None:
+            source = (message.text or message.caption or "").strip()
+
+        rerolled = ""
+        if source:
+            rerolled = await self.ask_ai(chat_id, source, message=message, temperature=reroll_temp)
+            rerolled = re.sub(r"<think>[\s\S]*?</think>", "", rerolled or "").strip()
+            rerolled = rerolled.replace(MARKER_INVITATION, "").replace(INVITE_MARKER, "").strip()
+            update_match = re.search(r"ОБНОВИТЬ_ДАННЫЕ:\s*([^\n]+)", rerolled)
+            if update_match:
+                await self._handle_update_marker(chat_id, update_match.group(1).strip())
+                rerolled = rerolled.replace(update_match.group(0), "").strip()
+
+        if rerolled and not _contains_han(rerolled):
+            log.info("[%s][AI] Повторная генерация для %s пришла на русском", self.name, chat_id)
+            return rerolled
+
+        cleaned = _strip_han(rerolled) or _strip_han(reply)
+        log.warning(
+            "[%s][AI] Повторный сбой языка для %s, иероглифы вырезаны: '%s'",
+            self.name, chat_id, cleaned[:60],
+        )
+        return cleaned
 
     async def _remember_successful_reply(
         self,
@@ -2473,6 +2534,8 @@ class AccountBot:
             log.info("[%s][PROCESS_REPLY] Приглашение успешно зафиксировано для %s (%s)", self.name, name, username)
             await self._remember_successful_reply(chat_id, message, invite_text, user_text=user_text)
             return
+
+        reply = await self._guard_russian_reply(chat_id, reply, message, user_text)
 
         if reply:
             chunks = split_reply_chunks(reply)
@@ -4093,9 +4156,9 @@ async def main() -> None:
     log.info("Запуск системы мультиаккаунтности. Список аккаунтов: %s", ACCOUNTS)
     log.info("Telegram API: API_ID=%s (загружен из .env)", API_ID)
     log.info(
-        "ИИ-канал: Локальная модель Transformers + LoRA (база: %s, адаптер: %s)",
-        BASE_MODEL,
-        ADAPTER_PATH,
+        "ИИ-канал: локальная Ollama (модель %s, %s)",
+        OLLAMA_MODEL,
+        OLLAMA_HOST,
     )
     log.info(
         "Автолайкер Дайвинчика: активен=%s, дневной лимит=%d",

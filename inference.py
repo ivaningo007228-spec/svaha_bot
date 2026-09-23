@@ -151,7 +151,7 @@ def generate_reply(
     temperature: float = 0.4,
     top_p: float = 0.9,
     top_k: int = 50,
-    repetition_penalty: float = 1.18,
+    repetition_penalty: float = 1.08,
     max_new_tokens: int = 64,
 ) -> str:
     """Генерация ответа Ивана с использованием Chat Template модели Qwen."""
@@ -225,8 +225,8 @@ def main():
     parser.add_argument(
         "--repetition-penalty",
         type=float,
-        default=1.18,
-        help="Штраф за повторы / repetition_penalty (по умолчанию: 1.18)",
+        default=1.08,
+        help="Штраф за повторы / repetition_penalty (по умолчанию: 1.08)",
     )
     parser.add_argument(
         "--max-new-tokens",

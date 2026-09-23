@@ -8,6 +8,9 @@ python-dotenv>=1.0.1
 # Data & Tables
 openpyxl>=3.1.5
 
+# Локальный инференс юзербота через Ollama
+ollama>=0.4.0
+
 # Deep Learning / LLM Local Inference & Fine-Tuning
 torch>=2.2.0
 transformers>=4.45.0
