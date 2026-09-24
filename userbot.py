@@ -1029,6 +1029,17 @@ LATIN_SCRIPT_BAN = (
     "ВСЕ СЛОВА ДОЛЖНЫ БЫТЬ НАПИСАНЫ ИСКЛЮЧИТЕЛЬНО КИРИЛЛИЦЕЙ НА ЖИВОМ РУССКОМ СЛЕНГЕ"
 )
 
+VANYA_NAME_BAN = (
+    "ТЕБЕ КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО НАЗЫВАТЬ СОБЕСЕДНИКА ИМЕНЕМ ВАНЯ. "
+    "ВАНЯ — ЭТО ТЫ, А НЕ ОНА. "
+    "Если тебе нужно обратиться к ней, используй нейтральное 'ты', 'слушай' или вообще не называй по имени"
+)
+
+VANYA_REROLL_HINT = (
+    "Ошибка! Ты назвал собеседника своим именем Ваня. "
+    "Перепиши ответ без использования этого имени"
+)
+
 RUSSIAN_LANGUAGE_LOCK = (
     "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ КИТАЙСКИЕ ИЕРОГЛИФЫ ИЛИ АНГЛИЙСКИЙ ЯЗЫК. "
     "ТЫ ОБЩАЕШЬСЯ СТРОГО НА РУССКОМ ЯЗЫКЕ. "
@@ -1065,7 +1076,15 @@ _PAST_MEET_RE = re.compile(
     r"\b(вчера|был[аои]?|сидел[аи]?|ходил[аи]?|гулял[аи]?|встретил(?:ся|ась|ись)?)\b",
     re.IGNORECASE,
 )
-_PROMPT_LOCKS = (DATE_INITIATIVE_BAN, LATIN_SCRIPT_BAN, RUSSIAN_LANGUAGE_LOCK)
+_VANYA_NAME_RE = re.compile(
+    r"(?<![0-9A-Za-zА-Яа-яЁё])Ван(?:ей|ею|я|и|е|ю|ь)(?![0-9A-Za-zА-Яа-яЁё])",
+    re.IGNORECASE,
+)
+_VANYA_SELF_BEFORE_RE = re.compile(
+    r"(?:^|[\s,])(?:я|меня\s+зовут|зовут|мо[её]\s+имя|это\s+я)[\s,:\-—]*$",
+    re.IGNORECASE,
+)
+_PROMPT_LOCKS = (DATE_INITIATIVE_BAN, LATIN_SCRIPT_BAN, VANYA_NAME_BAN, RUSSIAN_LANGUAGE_LOCK)
 
 
 def _contains_han(text: str) -> bool:
@@ -1157,6 +1176,38 @@ def _drop_meetup_sentences(text: str) -> str:
     return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
 
+def _vanya_span_is_self(text: str, start: int, end: int) -> bool:
+    """«Я Ваня» и «меня зовут Ваня» — про себя. «Ваня,» и «слушай, Вань» — уже обращение к ней."""
+    before = (text or "")[max(0, start - 32):start].replace("ё", "е").replace("Ё", "Е")
+    after = (text or "")[end:end + 16].replace("ё", "е").replace("Ё", "Е")
+    if _VANYA_SELF_BEFORE_RE.search(before):
+        return True
+    return bool(re.match(r"[\s\-—]+это\s+я\b", after, re.IGNORECASE))
+
+
+def _addresses_her_as_vanya(text: str) -> bool:
+    """Имя Ваня стоит как обращение к собеседнице, а не как представление себя."""
+    raw = text or ""
+    for match in _VANYA_NAME_RE.finditer(raw):
+        if not _vanya_span_is_self(raw, match.start(), match.end()):
+            return True
+    return False
+
+
+def _strip_vanya_address(text: str) -> str:
+    """Убирает обращение «Ваня», представление «я Ваня» не трогает."""
+    def repl(match: re.Match) -> str:
+        if _vanya_span_is_self(match.string, match.start(), match.end()):
+            return match.group(0)
+        return ""
+
+    cleaned = _VANYA_NAME_RE.sub(repl, text or "")
+    cleaned = re.sub(r"\s+,", ",", cleaned)
+    cleaned = re.sub(r"(^|\s),+", r"\1", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.strip(" ,;:-")
+
+
 def _has_invite_marker(text: str) -> bool:
     folded = (text or "").casefold()
     if MARKER_INVITATION.casefold() in folded:
@@ -1178,7 +1229,10 @@ def _seal_russian_prompt(prompt: str) -> str:
     body = (prompt or "").strip()
     for lock in _PROMPT_LOCKS:
         body = _strip_prompt_lock(body, lock)
-    head = f"{DATE_INITIATIVE_BAN}\n\n{LATIN_SCRIPT_BAN}\n\n{RUSSIAN_LANGUAGE_LOCK}"
+    head = (
+        f"{DATE_INITIATIVE_BAN}\n\n{LATIN_SCRIPT_BAN}\n\n"
+        f"{VANYA_NAME_BAN}\n\n{RUSSIAN_LANGUAGE_LOCK}"
+    )
     if not body:
         return f"{head}\n\n{RUSSIAN_LANGUAGE_LOCK}"
     return f"{head}\n\n{body}\n\n{RUSSIAN_LANGUAGE_LOCK}"
@@ -1205,6 +1259,7 @@ DEFAULT_SYSTEM_PROMPT = f"""\
 3. ЗАПРЕТ НА ЭХО И ПОВТОРЕНИЯ (ТЫ НЕ ПОПУГАЙ): ЗАПРЕЩЕНО повторять или копировать слова и фразы из последнего сообщения девушки (например, если она написала 'Новый год и лето', запрещено отвечать 'Новый год и лето звучат круто'). Ты не попугай. Твоя задача — вести диалог вперед своими словами, а не комментировать её слова её же фразами.
 4. БОРЬБА СО СПАМОМ ПРИВЕТСТВИЙ: Запрещено здороваться, если диалог уже начат. Слово 'привет' или 'приветик' допускается ИСКЛЮЧИТЕЛЬНО в самом первом сообщении чата или если девушка сама только что поздоровалась. Если тебе передана история переписки, где вы уже общались, сразу отвечай на её реплику без приветствий.
 5. ГЕНДЕРНЫЙ КОНТРОЛЬ: Твой собеседник — ВСЕГДА ДЕВУШКА. Ты обязан обращаться к ней СТРОГО в женском роде (например: ты сказала, ты видела, ты подумала).
+{VANYA_NAME_BAN}
 6. ПОЛНЫЙ ЗАПРЕТ НА СКОБОЧКИ И СМАЙЛИКИ: НИКАКИХ графических эмодзи и скобочек ) или )) по умолчанию. Забудь про них. Пиши абсолютно без них. Использовать ОДНУ скобочку ')' разрешено только в 1 случае из 10, если ты реально пошутил или подколол.
 7. БЕЗ ТОЧЕК: Никогда не ставь точку в самом конце сообщения.
 8. ОБРАЗ И ТОН: Живой, непринужденный, вежливый пацанский стиль без канцеляризмов и пошлости.
@@ -2306,6 +2361,7 @@ class AccountBot:
         user_text: str,
         message: Message | None = None,
         temperature: float = OLLAMA_TEMPERATURE,
+        hidden_hint: str | None = None,
     ) -> str:
         """
         Генерация ответа через локальную Ollama (модель vanya_q5).
@@ -2345,6 +2401,8 @@ class AccountBot:
 
         # Языковой замок остаётся первой и последней фразой, даже после RAG и цели слота.
         system_prompt = _seal_russian_prompt(system_prompt)
+        if hidden_hint and hidden_hint.strip():
+            system_prompt = f"{system_prompt}\n\n{hidden_hint.strip()}"
 
         # 2. Скользящее окно контекста: считываем ТОЛЬКО последние 10-15 сообщений из logs_chats/{user_id}.txt
         history = await self.read_chat_log_window(user_id, limit=15)
@@ -2402,7 +2460,7 @@ class AccountBot:
             if msg_content and isinstance(msg_content, str) and msg_content.strip():
                 content = msg_content.strip()
                 if msg_role == "assistant":
-                    content = _strip_latin_letters(_strip_technical_markers(content))
+                    content = _strip_vanya_address(_strip_latin_letters(_strip_technical_markers(content)))
                 if content:
                     dialog_history.append({"role": msg_role, "content": content})
 
@@ -2486,6 +2544,8 @@ class AccountBot:
                 visible = _strip_latin_letters(visible)
             if _proposes_meetup(visible):
                 visible = _drop_meetup_sentences(visible)
+            if _addresses_her_as_vanya(visible):
+                visible = _strip_vanya_address(visible)
             visible = _strip_technical_markers(visible)
             return visible.strip(), _archive_with_markers(visible, model_text)
 
@@ -2493,10 +2553,13 @@ class AccountBot:
         han = _contains_han(screened)
         latin = _contains_latin(screened)
         meetup = _proposes_meetup(screened)
-        if not han and not latin and not meetup:
+        vanya = _addresses_her_as_vanya(screened)
+        if not han and not latin and not meetup and not vanya:
             return screened, _archive_with_markers(screened, reply)
 
-        if latin or meetup:
+        if vanya:
+            reroll_temp = 0.35
+        elif latin or meetup:
             reroll_temp = 0.3
         else:
             reroll_temp = max(0.1, OLLAMA_TEMPERATURE - 0.1)
@@ -2507,6 +2570,8 @@ class AccountBot:
             reasons.append("латиница")
         if meetup:
             reasons.append("зов на встречу")
+        if vanya:
+            reasons.append("обращение Ваня")
         log.warning(
             "[%s][AI] В ответе для %s найдено: %s. Повтор генерации с температурой %.2f",
             self.name, chat_id, ", ".join(reasons), reroll_temp,
@@ -2517,14 +2582,26 @@ class AccountBot:
 
         rerolled = ""
         if source:
-            rerolled = await self.ask_ai(chat_id, source, message=message, temperature=reroll_temp)
+            rerolled = await self.ask_ai(
+                chat_id,
+                source,
+                message=message,
+                temperature=reroll_temp,
+                hidden_hint=VANYA_REROLL_HINT if vanya else None,
+            )
             rerolled = re.sub(r"<think>[\s\S]*?</think>", "", rerolled or "").strip()
             update_match = re.search(r"(?i:обновить_данные)\s*:\s*([^\n]+)", rerolled)
             if update_match:
                 await self._handle_update_marker(chat_id, update_match.group(1).strip())
 
         reroll_screened = _strip_technical_markers(rerolled)
-        if reroll_screened and not _contains_han(reroll_screened) and not _contains_latin(reroll_screened) and not _proposes_meetup(reroll_screened):
+        if (
+            reroll_screened
+            and not _contains_han(reroll_screened)
+            and not _contains_latin(reroll_screened)
+            and not _proposes_meetup(reroll_screened)
+            and not _addresses_her_as_vanya(reroll_screened)
+        ):
             log.info("[%s][AI] Повторная генерация для %s прошла проверку", self.name, chat_id)
             return reroll_screened, _archive_with_markers(reroll_screened, rerolled)
 
