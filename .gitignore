@@ -28,6 +28,7 @@ vanya_lora_weights/
 vanya_merged_hf/
 models/
 .tools/
+downloads/
 checkpoint-*/
 *.bin
 *.pt

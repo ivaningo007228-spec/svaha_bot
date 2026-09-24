@@ -416,9 +416,8 @@ OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "vanya_q5")
 MOONDREAM_MODEL: str = os.getenv("MOONDREAM_MODEL", "moondream")
 MOONDREAM_PROMPT: str = (
-    "Что изображено на этой картинке? Если на ней есть текст, мемы или надписи "
-    "на русском или английском языке, дословно напиши их содержание. "
-    "Ответь очень кратко, в одном-двух предложениях на русском языке"
+    "Что изображено на этой картинке? Если это мем или фото с текстом, "
+    "дословно напиши этот текст на русском. Ответь кратко в одном предложении."
 )
 PHOTO_VISION_FALLBACK: str = "ппц у меня тут инет лагает, картинка не прогрузилась, че там?"
 # Штраф выше ~1.1 заставляет Qwen бросать кириллицу и срываться в иероглифы.
@@ -3847,10 +3846,26 @@ class AccountBot:
         photo_path: str | None = None
         client: AsyncClient | None = None
         try:
-            photo_path = await message.download()
-            if not photo_path:
-                log.warning("[%s][PHOTO] Не удалось скачать фото из чата %s", self.name, message.chat.id)
+            target = BASE_DIR / "downloads" / f"photo_{message.chat.id}_{message.id}.jpg"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                target.unlink()
+            downloaded = await message.download(file_name=str(target))
+            photo_file = Path(downloaded).resolve() if downloaded else None
+            photo_path = str(photo_file) if photo_file is not None else None
+            if photo_file is None or not photo_file.is_file() or photo_file.stat().st_size <= 0:
+                log.warning(
+                    "[%s][PHOTO] Скачанный файл не найден или пустой: %r",
+                    self.name,
+                    downloaded,
+                )
                 return None
+            log.info(
+                "[%s][PHOTO] Фото на диске: %s (%d байт)",
+                self.name,
+                photo_path,
+                photo_file.stat().st_size,
+            )
             # trust_env=False: httpx 0.28 не принимает proxies={}, иначе локальная Ollama уйдёт в системный прокси.
             client = AsyncClient(
                 host=os.getenv("OLLAMA_HOST", OLLAMA_HOST),
