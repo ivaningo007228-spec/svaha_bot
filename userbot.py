@@ -489,7 +489,7 @@ async def init_vector_memory() -> None:
             "[QDRANT] Подключение к %s:%s, коллекция '%s'...",
             QDRANT_HOST, QDRANT_PORT, QDRANT_COLLECTION,
         )
-        qdrant_client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+        qdrant_client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30.0)
 
         if not await qdrant_client.collection_exists(QDRANT_COLLECTION):
             await qdrant_client.create_collection(
