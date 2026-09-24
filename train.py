@@ -46,6 +46,14 @@ logger = logging.getLogger("qwen_trainer")
 BASE_DIR = Path(__file__).parent.resolve()
 
 
+def _project_path(raw: str) -> Path:
+    """Абсолютный путь как есть, относительный — от папки проекта, не от cwd."""
+    path = Path(raw)
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
 def check_gpu_environment():
     """Проверка доступности CUDA и видеопамяти."""
     if not torch.cuda.is_available():
@@ -154,8 +162,8 @@ def main():
     parser.add_argument(
         "--dataset-path",
         type=str,
-        default=os.getenv("DATASET_PATH", str(BASE_DIR / "my_training_dataset.jsonl")),
-        help="Путь к файлу датасета JSONL (по умолчанию: my_training_dataset.jsonl)",
+        default=os.getenv("DATASET_PATH", str(BASE_DIR / "dataset_unsloth.jsonl")),
+        help="Путь к файлу датасета JSONL (из .env: DATASET_PATH)",
     )
     parser.add_argument(
         "--output-dir",
@@ -235,7 +243,7 @@ def main():
     # Проверка GPU
     check_gpu_environment()
 
-    dataset_file = Path(args.dataset_path).resolve()
+    dataset_file = _project_path(args.dataset_path)
     if not dataset_file.exists():
         logger.error("Файл датасета не найден: %s", dataset_file)
         print("Сначала запустите скрипт сборки датасета: python dataset_creator.py")
@@ -298,7 +306,7 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
     # 3. НАКАТЫВАНИЕ LORA АДАПТЕРА (ИЛИ ПОДГРУЗКА ИЗ ЧЕКПОИНТА)
     # ─────────────────────────────────────────────────────────────────────────
-    output_path = Path(args.output_dir).resolve()
+    output_path = _project_path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     ckpt_400 = output_path / "checkpoint-400"
@@ -476,14 +484,8 @@ def main():
         print("🎉 ОБУЧЕНИЕ УСПЕШНО ЗАВЕРШЕНО!")
     print("=" * 70)
     print(f"📁 Обученные LoRA-веса сохранены в: {output_path}")
-    print("\nИнструкция для подключения в Ollama:")
-    print("1. Создайте файл Modelfile:")
-    print("   FROM qwen2.5:7b-instruct-q4_K_M")
-    print(f"   ADAPTER {output_path.as_posix()}")
-    print("2. Соберите модель:")
-    print("   ollama create vanya_qwen -f Modelfile")
-    print("3. Пропишите в .env:")
-    print("   OLLAMA_MODEL=vanya_qwen")
+    print("\nДальше одной командой собери GGUF и обнови vanya_q5 в Ollama:")
+    print("   py merge_to_gguf.py")
     print("=" * 70)
 
 

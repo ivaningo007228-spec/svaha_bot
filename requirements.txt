@@ -20,6 +20,11 @@ accelerate>=0.30.0
 datasets>=2.19.0
 trl>=0.8.0
 
+# HF -> GGUF в merge_to_gguf.py (сам квантайзер llama-quantize качается в .tools)
+gguf>=0.17.0
+protobuf>=5.0.0
+sentencepiece>=0.2.0
+
 # Векторная память диалогов (Qdrant + эмбеддер на CPU)
 qdrant-client>=1.12.0
 sentence-transformers>=3.0.0

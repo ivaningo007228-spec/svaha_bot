@@ -25,7 +25,9 @@ sessions/
 
 # ── LoRA Weights, Checkpoints & Large Models ──
 vanya_lora_weights/
+vanya_merged_hf/
 models/
+.tools/
 checkpoint-*/
 *.bin
 *.pt
