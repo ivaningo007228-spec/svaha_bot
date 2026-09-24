@@ -2374,7 +2374,7 @@ class AccountBot:
         Контекст собеседника берётся из Excel, Qdrant и скользящего окна переписки.
         Отмена задачи не превращается в пустую строку: Debouncer ловит CancelledError.
         """
-        log.info("[%s][AI] Запрос в Ollama для user_id=%s. Текст: '%s'", self.name, user_id, user_text[:60].replace("\n", " "))
+        log.info("[%s][AI] Собираем контекст для %s. Текст: '%s'", self.name, user_id, user_text[:60].replace("\n", " "))
         chat_data = self.active_chats.get(user_id) or self.active_chats.get(str(user_id), {})
 
         username = chat_data.get("username")
@@ -2487,14 +2487,11 @@ class AccountBot:
             self.name, len(messages), len(messages) - 1, messages[-1]["role"], messages[-1]["content"][:60]
         )
 
-        # 4. Асинхронный запрос в Ollama. await client.chat не блокирует event loop:
-        # AsyncClient ходит в HTTP через httpx, печать и Pyrogram в это время живут отдельно.
-        client = AsyncClient(host=os.getenv("OLLAMA_HOST", OLLAMA_HOST))
+        # 4. Один асинхронный запрос в Ollama. timeout не даёт httpx ждать вечно.
+        client = AsyncClient(host=os.getenv("OLLAMA_HOST", OLLAMA_HOST), timeout=60.0)
         model_name = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
         try:
-            print(f"[DEBUG] Запрос в Ollama, модель {model_name}", flush=True)
-            log.info("[%s][AI] Запрос в Ollama, модель %s", self.name, model_name)
-            ollama_started = time.perf_counter()
+            logger.info("Отправлен запрос в Ollama...")
             response = await client.chat(
                 model=model_name,
                 messages=messages,
@@ -2506,21 +2503,14 @@ class AccountBot:
                     "num_predict": 96,
                 },
             )
-            ollama_elapsed = time.perf_counter() - ollama_started
-            print(f"[DEBUG] Ответ от Ollama получен за {ollama_elapsed:.2f} секунд", flush=True)
-            log.info("[%s][DEBUG] Ответ от Ollama получен за %.2f секунд", self.name, ollama_elapsed)
+            logger.info("Ответ от Ollama успешно получен!")
             ai_text = _ollama_message_text(response)
-            log.info(
-                "[%s][AI] Успешный ответ от Ollama для %s (длина: %d симв.): '%s'",
-                self.name, user_id, len(ai_text), ai_text[:60]
-            )
             return ai_text
         except asyncio.CancelledError:
             log.info("[%s][AI] Генерация для %s отменена: собеседница дописала мысль", self.name, user_id)
             raise
         except Exception as e:
             log.error("[%s] Критическая ошибка запроса в Ollama: %s", self.name, e, exc_info=True)
-            print(f"[{self.name}][DEBUG ИИ] Критическая ошибка генерации: {e}", flush=True)
             return ""
         finally:
             try:
