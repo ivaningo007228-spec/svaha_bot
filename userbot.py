@@ -37,7 +37,7 @@ import openpyxl
 from openpyxl import load_workbook
 from dotenv import load_dotenv
 from pyrogram import Client, enums, filters, idle, raw
-from pyrogram.types import Message
+from pyrogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Логирование
@@ -4694,47 +4694,103 @@ def _admin_status_text() -> str:
     return "\n".join(lines)
 
 
+def _admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статус системы", callback_data="admin_status")],
+        [InlineKeyboardButton("📥 Выгрузить JSONL", callback_data="admin_export")],
+        [InlineKeyboardButton("🌙/☀️ Сменить режим", callback_data="admin_toggle_mode")],
+    ])
+
+
+def _toggle_all_modes() -> str:
+    if not ACCOUNT_BOTS:
+        return "Юзерботы ещё не подняты."
+    turn_night = not ACCOUNT_BOTS[0].night_mode_active
+    for account in ACCOUNT_BOTS:
+        _apply_forced_mode(account, turn_night)
+    if turn_night:
+        return "Ночной режим включён вручную. Инициация чатов спит, ответы девушкам остаются."
+    return "Дневной режим включён вручную. Инициация чатов снова разрешена."
+
+
+async def _send_today_dataset(message: Message) -> str | None:
+    """Шлёт dataset_unsloth.jsonl в чат. None — файл ушёл, иначе текст ошибки."""
+    await message.reply_text("Собираю сегодняшний датасет...")
+    try:
+        from export_dataset import OUTPUT_PATH, export_unsloth_dataset, load_vanya_system_prompt
+
+        system_prompt = load_vanya_system_prompt()
+        found, today, written = await export_unsloth_dataset(system_prompt)
+    except Exception as exc:
+        log.exception("[ADMIN] Не удалось собрать датасет")
+        await message.reply_text(f"Экспорт не удался: {exc}")
+        return str(exc)
+    if written <= 0 or not OUTPUT_PATH.is_file() or OUTPUT_PATH.stat().st_size <= 0:
+        note = f"За сегодня пусто. Просмотрено точек: {found}, за сегодня: {today}, записано: {written}."
+        await message.reply_text(note)
+        return note
+    await message.reply_document(
+        str(OUTPUT_PATH),
+        caption=f"dataset_unsloth.jsonl — сегодня {written} диалогов",
+    )
+    return None
+
+
 def _bind_admin_handlers(bot: Client, owner_id: int) -> None:
     owner = filters.user(owner_id)
+    keyboard = _admin_keyboard
+
+    @bot.on_message(filters.command("start") & owner)
+    async def _admin_start(_client: Client, message: Message) -> None:
+        await message.reply_text(
+            "Панель Вани на связи.\n"
+            "Метрики, датасет и день/ночь — кнопками ниже или командами из меню.",
+            reply_markup=keyboard(),
+        )
 
     @bot.on_message(filters.command("status") & owner)
     async def _admin_status(_client: Client, message: Message) -> None:
-        await message.reply_text(_admin_status_text())
+        await message.reply_text(_admin_status_text(), reply_markup=keyboard())
 
     @bot.on_message(filters.command("export") & owner)
     async def _admin_export(_client: Client, message: Message) -> None:
-        await message.reply_text("Собираю сегодняшний датасет...")
-        try:
-            from export_dataset import OUTPUT_PATH, export_unsloth_dataset, load_vanya_system_prompt
-
-            system_prompt = load_vanya_system_prompt()
-            found, today, written = await export_unsloth_dataset(system_prompt)
-        except Exception as exc:
-            log.exception("[ADMIN] Не удалось собрать датасет")
-            await message.reply_text(f"Экспорт не удался: {exc}")
-            return
-        if written <= 0 or not OUTPUT_PATH.is_file() or OUTPUT_PATH.stat().st_size <= 0:
-            await message.reply_text(
-                f"За сегодня пусто. Просмотрено точек: {found}, за сегодня: {today}, записано: {written}."
-            )
-            return
-        await message.reply_document(
-            str(OUTPUT_PATH),
-            caption=f"dataset_unsloth.jsonl — сегодня {written} диалогов",
-        )
+        await _send_today_dataset(message)
 
     @bot.on_message(filters.command("mode") & owner)
     async def _admin_mode(_client: Client, message: Message) -> None:
-        if not ACCOUNT_BOTS:
-            await message.reply_text("Юзерботы ещё не подняты.")
+        await message.reply_text(_toggle_all_modes(), reply_markup=keyboard())
+
+    @bot.on_callback_query(owner)
+    async def _admin_callbacks(_client: Client, callback_query: CallbackQuery) -> None:
+        data = callback_query.data or ""
+        message = callback_query.message
+        if message is None:
+            await callback_query.answer()
             return
-        turn_night = not ACCOUNT_BOTS[0].night_mode_active
-        for account in ACCOUNT_BOTS:
-            _apply_forced_mode(account, turn_night)
-        if turn_night:
-            await message.reply_text("Ночной режим включён вручную. Инициация чатов спит, ответы девушкам остаются.")
-        else:
-            await message.reply_text("Дневной режим включён вручную. Инициация чатов снова разрешена.")
+        if data == "admin_status":
+            try:
+                await message.edit_text(_admin_status_text(), reply_markup=keyboard())
+            except Exception as exc:
+                if "MESSAGE_NOT_MODIFIED" not in str(exc).upper():
+                    await message.reply_text(_admin_status_text(), reply_markup=keyboard())
+            await callback_query.answer()
+            return
+        if data == "admin_export":
+            error = await _send_today_dataset(message)
+            if error:
+                await callback_query.answer(error[:180], show_alert=True)
+            else:
+                await callback_query.answer("Датасет успешно отправлен!", show_alert=True)
+            return
+        if data == "admin_toggle_mode":
+            text = _toggle_all_modes()
+            try:
+                await message.edit_text(text, reply_markup=keyboard())
+            except Exception:
+                await message.reply_text(text, reply_markup=keyboard())
+            await callback_query.answer()
+            return
+        await callback_query.answer()
 
 
 async def _run_admin_bot(bot: Client) -> None:
@@ -4743,6 +4799,14 @@ async def _run_admin_bot(bot: Client) -> None:
     except Exception as exc:
         log.error("[ADMIN] Не удалось запустить админ-бота: %s", exc)
         return
+    try:
+        await bot.set_bot_commands([
+            BotCommand("status", "Посмотреть текущие метрики и режим ПК"),
+            BotCommand("export", "Собрать и прислать датасет для Unsloth"),
+            BotCommand("mode", "Принудительно сменить режим День/Ночь"),
+        ])
+    except Exception as exc:
+        log.warning("[ADMIN] Меню команд не записалось: %s", exc)
     log.info("[ADMIN] Админ-бот запущен")
     try:
         await asyncio.Event().wait()
