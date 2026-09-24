@@ -6,6 +6,7 @@ Pyrogram + локальная Ollama (vanya_q5) + openpyxl + Умный авто
 """
 
 import asyncio
+import base64
 from datetime import datetime, time as dtime, timedelta
 import hashlib
 import json
@@ -416,8 +417,9 @@ OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "vanya_q5")
 MOONDREAM_MODEL: str = os.getenv("MOONDREAM_MODEL", "moondream")
 MOONDREAM_PROMPT: str = (
-    "Что изображено на этой картинке? Если это мем или фото с текстом, "
-    "дословно напиши этот текст на русском. Ответь кратко в одном предложении."
+    "Опиши подробно и понятно, что изображено на этой фотографии? "
+    "Если это мем с текстом, дословно перепиши весь текст на русском. "
+    "Ответь кратко на русском языке."
 )
 PHOTO_VISION_FALLBACK: str = "ппц у меня тут инет лагает, картинка не прогрузилась, че там?"
 # Штраф выше ~1.1 заставляет Qwen бросать кириллицу и срываться в иероглифы.
@@ -3872,13 +3874,19 @@ class AccountBot:
                 timeout=60.0,
                 trust_env=False,
             )
-            log.info("[%s][PHOTO] Запрос описания в moondream", self.name)
+            with open(photo_path, "rb") as image_file:
+                img_base64 = base64.b64encode(image_file.read()).decode("utf-8")
+            log.info(
+                "[%s][PHOTO] Запрос описания в moondream, картинка в base64 (%d симв.)",
+                self.name,
+                len(img_base64),
+            )
             response = await client.chat(
                 model=MOONDREAM_MODEL,
                 messages=[{
                     "role": "user",
                     "content": MOONDREAM_PROMPT,
-                    "images": [photo_path],
+                    "images": [img_base64],
                 }],
             )
             description = _ollama_message_text(response)
