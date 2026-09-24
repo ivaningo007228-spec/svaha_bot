@@ -1,12 +1,13 @@
 """
-Независимая выгрузка диалогов из Qdrant в JSONL для Unsloth.
+Независимая выгрузка сегодняшних диалогов из Qdrant в JSONL для Unsloth.
 
-Читает QDRANT_HOST и QDRANT_PORT из .env, через Scroll API забирает все точки
-коллекции vanya_memories и пишет dataset_unsloth.jsonl в корне проекта.
-Системный промпт каждой пары — актуальный SYSTEM_PROMPT из userbot.py.
+Читает QDRANT_HOST и QDRANT_PORT из .env, через Scroll API забирает точки
+коллекции vanya_memories за текущие сутки и пишет dataset_unsloth.jsonl
+в корне проекта. Системный промпт каждой пары — актуальный SYSTEM_PROMPT из userbot.py.
 """
 
 import asyncio
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ load_dotenv(BASE_DIR / ".env")
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 COLLECTION_NAME = "vanya_memories"
 OUTPUT_PATH = BASE_DIR / "dataset_unsloth.jsonl"
@@ -47,13 +48,33 @@ def load_vanya_system_prompt() -> str:
     return prompt
 
 
-async def export_unsloth_dataset(system_prompt: str) -> tuple[int, int]:
+def _saved_on_today(payload: dict) -> bool:
+    """Точка попадает в датасет, только если её timestamp — сегодняшние локальные сутки."""
+    raw = str(payload.get("timestamp") or "").strip()
+    if not raw:
+        return False
+    try:
+        saved_at = datetime.fromisoformat(raw)
+    except ValueError:
+        return False
+    if saved_at.tzinfo is not None:
+        saved_at = saved_at.astimezone().replace(tzinfo=None)
+    return saved_at.date() == datetime.now().date()
+
+
+async def export_unsloth_dataset(system_prompt: str) -> tuple[int, int, int]:
     """
-    Листает всю коллекцию и пишет пары в JSONL.
-    Возвращает (сколько точек просмотрено, сколько строк записано).
+    Листает коллекцию и пишет сегодняшние пары в JSONL.
+    Возвращает (просмотрено, за сегодня, записано).
     """
-    client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+    client = AsyncQdrantClient(
+        host=QDRANT_HOST,
+        port=QDRANT_PORT,
+        timeout=30.0,
+        trust_env=False,
+    )
     found = 0
+    today = 0
     written = 0
     offset = None
 
@@ -70,6 +91,9 @@ async def export_unsloth_dataset(system_prompt: str) -> tuple[int, int]:
                 for point in points or []:
                     found += 1
                     payload = getattr(point, "payload", None) or {}
+                    if not isinstance(payload, dict) or not _saved_on_today(payload):
+                        continue
+                    today += 1
                     user_message = str(payload.get("user_message") or "").strip()
                     assistant_reply = str(payload.get("assistant_reply") or "").strip()
                     if not user_message or not assistant_reply:
@@ -88,16 +112,20 @@ async def export_unsloth_dataset(system_prompt: str) -> tuple[int, int]:
     finally:
         await client.close()
 
-    return found, written
+    return found, today, written
 
 
 async def main() -> None:
+    today_label = datetime.now().strftime("%Y-%m-%d")
     print(f"Подключение к Qdrant {QDRANT_HOST}:{QDRANT_PORT}, коллекция '{COLLECTION_NAME}'...")
+    print(f"В датасет попадут только диалоги за {today_label}")
     system_prompt = load_vanya_system_prompt()
     print(f"Системный промпт взят из userbot.py ({len(system_prompt)} симв.)")
-    found, written = await export_unsloth_dataset(system_prompt)
-    print(f"Всего точек найдено в Qdrant: {found}")
+    found, today, written = await export_unsloth_dataset(system_prompt)
+    print(f"Всего точек в коллекции: {found}")
+    print(f"Из них за сегодня: {today}")
     print(f"Успешно сконвертировано: {written}")
+    print(f"Файл: {OUTPUT_PATH}")
     print("[SUCCESS] Датасет dataset_unsloth.jsonl готов к загрузке в Unsloth!")
 
 
