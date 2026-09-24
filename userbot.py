@@ -2488,7 +2488,13 @@ class AccountBot:
         )
 
         # 4. Один асинхронный запрос в Ollama. timeout не даёт httpx ждать вечно.
-        client = AsyncClient(host=os.getenv("OLLAMA_HOST", OLLAMA_HOST), timeout=60.0)
+        # trust_env=False: httpx 0.28 больше не принимает proxies={},
+        # а системный HTTP_PROXY иначе уводит локальную Ollama в http_proxy.py.
+        client = AsyncClient(
+            host=os.getenv("OLLAMA_HOST", OLLAMA_HOST),
+            timeout=60.0,
+            trust_env=False,
+        )
         model_name = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
         try:
             logger.info("Отправлен запрос в Ollama...")
