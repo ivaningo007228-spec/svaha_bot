@@ -464,6 +464,36 @@ def _transcribe_voice_file(path: str) -> str:
     segments, _info = whisper_model.transcribe(path, language="ru")
     return " ".join([segment.text for segment in segments]).strip()
 
+
+def _voice_text_is_emotional(text: str) -> bool:
+    """Много вопросительных и восклицательных знаков или почти весь текст капсом."""
+    bursts = text.count("!") + text.count("?") + text.count("…")
+    if bursts >= 3:
+        return True
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) >= 6:
+        upper = sum(1 for ch in letters if ch.isupper())
+        if upper / len(letters) >= 0.45:
+            return True
+    if text.count(",") + text.count("!") + text.count("?") >= 6:
+        return True
+    return False
+
+
+async def _voice_context_marker(message: Message, text: str) -> str:
+    """Длина ГС и тон текста решают, какой маркер уйдёт в ask_ai."""
+    voice = getattr(message, "voice", None)
+    duration = int(getattr(voice, "duration", 0) or 0)
+    if duration > 20 or _voice_text_is_emotional(text):
+        return (
+            f"[Девушка записала тебе длинное, эмоциональное голосовое сообщение на {duration} секунд. "
+            f'Её текст: "{text}". Обрати внимание на длительность, подколи её за то, '
+            "что она наговорила целый подкаст, ответь живо!]"
+        )
+    if duration < 5:
+        return f'[Девушка закинула короткое голосовое на ходу: "{text}"]'
+    return f"[Девушка прислала тебе голосовое сообщение: {text}]"
+
 # Склейка мыслей собеседника: общие словари модуля
 pending_messages: dict[int, list[str]] = {}
 debouncer_tasks: dict[int, asyncio.Task] = {}
@@ -1652,6 +1682,8 @@ class AccountBot:
         self.resurrector_task: asyncio.Task | None = None
         self.day_worker_task: asyncio.Task | None = None
         self.night_mode_active: bool = False
+        # None — режим берёт часы. True/False — ручной переключатель /mode, пока снова не переключат.
+        self.forced_night: bool | None = None
         self.day_mode_event: asyncio.Event = asyncio.Event()
 
         # Чаты этого аккаунта, чьи таски лежат в модульных pending_messages / debouncer_tasks
@@ -3923,7 +3955,7 @@ class AccountBot:
             )
             return
 
-        msg_text = f"[Девушка прислала тебе голосовое сообщение: {text}]"
+        msg_text = await _voice_context_marker(message, text)
         log.info("[%s][VOICE] Чат %d: расшифровка готова, отдаём в ask_ai", self.name, chat_id)
         self._append_to_history(chat_id, "user", msg_text)
         chat_data["last_msg_is_me"] = False
@@ -4100,6 +4132,8 @@ class AccountBot:
                 # Шаг 1: Берем текущее локальное время и определяем режим
                 now = datetime.now()
                 is_night, seconds_to_sleep, target_dt = self.calculate_mode_delta(now)
+                if self.forced_night is not None:
+                    is_night = self.forced_night
 
                 # Шаг 2: Немедленно включаем нужный режим
                 self.night_mode_active = is_night
@@ -4135,25 +4169,35 @@ class AccountBot:
                 if self._stop_event.is_set():
                     break
 
-                # Шаг 5: Просыпаемся и автоматически меняем статус на противоположный
+                # Шаг 5: Просыпаемся и автоматически меняем статус на противоположный.
+                # Ручной /mode не отдаём часам, пока владелец снова не переключит режим.
                 now_after = datetime.now()
-                new_is_night, _, _ = self.calculate_mode_delta(now_after)
+                if self.forced_night is None:
+                    new_is_night, _, _ = self.calculate_mode_delta(now_after)
+                else:
+                    new_is_night = self.forced_night
                 self.night_mode_active = new_is_night
 
                 if self.night_mode_active:
                     self.day_mode_event.clear()
-                    log.info(
-                        "[%s][RESURRECTOR] Наступило 21:00! Смена фазы: Ночной режим АКТИВИРОВАН. "
-                        "Инициация диалогов и пинг молчащих чатов заблокированы до 09:00 утра.",
-                        self.name
-                    )
+                    if self.forced_night is None:
+                        log.info(
+                            "[%s][RESURRECTOR] Наступило 21:00! Смена фазы: Ночной режим АКТИВИРОВАН. "
+                            "Инициация диалогов и пинг молчащих чатов заблокированы до 09:00 утра.",
+                            self.name
+                        )
+                    else:
+                        log.info("[%s][RESURRECTOR] Ручной ночной режим удерживается", self.name)
                 else:
                     self.day_mode_event.set()
-                    log.info(
-                        "[%s][RESURRECTOR] Наступило 09:00! Смена фазы: Дневной режим АКТИВИРОВАН. "
-                        "Инициация диалогов и пинг молчащих чатов разрешены до 21:00 вечера.",
-                        self.name
-                    )
+                    if self.forced_night is None:
+                        log.info(
+                            "[%s][RESURRECTOR] Наступило 09:00! Смена фазы: Дневной режим АКТИВИРОВАН. "
+                            "Инициация диалогов и пинг молчащих чатов разрешены до 21:00 вечера.",
+                            self.name
+                        )
+                    else:
+                        log.info("[%s][RESURRECTOR] Ручной дневной режим удерживается", self.name)
 
             except asyncio.CancelledError:
                 log.debug("[%s][RESURRECTOR] Фоновая задача планировщика ночного режима остановлена", self.name)
@@ -4607,6 +4651,126 @@ class AccountBot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+ACCOUNT_BOTS: list[AccountBot] = []
+
+
+def _task_label(task: asyncio.Task | None) -> str:
+    if task is None:
+        return "не запущен"
+    if task.cancelled():
+        return "отменён"
+    if task.done():
+        return "остановлен"
+    return "работает"
+
+
+def _apply_forced_mode(account: AccountBot, night: bool) -> None:
+    account.forced_night = night
+    account.night_mode_active = night
+    if night:
+        account.day_mode_event.clear()
+    else:
+        account.day_mode_event.set()
+    log.info("[%s][RESURRECTOR] Ручной режим: %s", account.name, "НОЧЬ" if night else "ДЕНЬ")
+
+
+def _admin_status_text() -> str:
+    if not ACCOUNT_BOTS:
+        return "Юзерботы ещё не подняты."
+    lines = ["Статус системы:"]
+    likes = 0
+    for account in ACCOUNT_BOTS:
+        likes += account.likes_today
+        mode = "Ночь" if account.night_mode_active else "День"
+        if account.forced_night is not None:
+            mode += ", ручной"
+        ai = "ИИ отвечает" if account.bot_active and not account.is_bot_asleep() else "ИИ заморожен"
+        lines.append(f"• {account.name}: {mode}, {ai}, лайки сегодня {account.likes_today}/{AUTOLIKE_DAILY_LIMIT}")
+        lines.append(f"  ночной планировщик: {_task_label(account.resurrector_task)}")
+        lines.append(f"  дневной обход чатов: {_task_label(account.day_worker_task)}")
+        lines.append(f"  автолайкер: {_task_label(account.autoliker_task)}")
+    lines.append(f"Лайков за сегодня по всем аккаунтам: {likes}")
+    lines.append(f"Автолайкер: {'включён' if AUTOLIKE_ENABLED else 'выключен'}")
+    return "\n".join(lines)
+
+
+def _bind_admin_handlers(bot: Client, owner_id: int) -> None:
+    owner = filters.user(owner_id)
+
+    @bot.on_message(filters.command("status") & owner)
+    async def _admin_status(_client: Client, message: Message) -> None:
+        await message.reply_text(_admin_status_text())
+
+    @bot.on_message(filters.command("export") & owner)
+    async def _admin_export(_client: Client, message: Message) -> None:
+        await message.reply_text("Собираю сегодняшний датасет...")
+        try:
+            from export_dataset import OUTPUT_PATH, export_unsloth_dataset, load_vanya_system_prompt
+
+            system_prompt = load_vanya_system_prompt()
+            found, today, written = await export_unsloth_dataset(system_prompt)
+        except Exception as exc:
+            log.exception("[ADMIN] Не удалось собрать датасет")
+            await message.reply_text(f"Экспорт не удался: {exc}")
+            return
+        if written <= 0 or not OUTPUT_PATH.is_file() or OUTPUT_PATH.stat().st_size <= 0:
+            await message.reply_text(
+                f"За сегодня пусто. Просмотрено точек: {found}, за сегодня: {today}, записано: {written}."
+            )
+            return
+        await message.reply_document(
+            str(OUTPUT_PATH),
+            caption=f"dataset_unsloth.jsonl — сегодня {written} диалогов",
+        )
+
+    @bot.on_message(filters.command("mode") & owner)
+    async def _admin_mode(_client: Client, message: Message) -> None:
+        if not ACCOUNT_BOTS:
+            await message.reply_text("Юзерботы ещё не подняты.")
+            return
+        turn_night = not ACCOUNT_BOTS[0].night_mode_active
+        for account in ACCOUNT_BOTS:
+            _apply_forced_mode(account, turn_night)
+        if turn_night:
+            await message.reply_text("Ночной режим включён вручную. Инициация чатов спит, ответы девушкам остаются.")
+        else:
+            await message.reply_text("Дневной режим включён вручную. Инициация чатов снова разрешена.")
+
+
+async def _run_admin_bot(bot: Client) -> None:
+    try:
+        await bot.start()
+    except Exception as exc:
+        log.error("[ADMIN] Не удалось запустить админ-бота: %s", exc)
+        return
+    log.info("[ADMIN] Админ-бот запущен")
+    try:
+        await asyncio.Event().wait()
+    finally:
+        try:
+            await bot.stop()
+        except Exception as exc:
+            log.debug("[ADMIN] Остановка админ-бота: %s", exc)
+
+
+def launch_admin_bot() -> asyncio.Task | None:
+    token = (os.getenv("ADMIN_BOT_TOKEN") or "").strip()
+    owner_raw = (os.getenv("MY_PERSONAL_TG_ID") or "").strip()
+    placeholder_token = token in ("", "вставь_сюда_токен_от_BotFather")
+    if placeholder_token or not owner_raw.isdigit():
+        log.warning("[ADMIN] В .env нет рабочего токена или числового MY_PERSONAL_TG_ID, админ-бот не запущен")
+        return None
+    admin_bot = Client(
+        "admin_bot_session",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=os.getenv("ADMIN_BOT_TOKEN"),
+        workdir=str(SESSIONS_DIR),
+    )
+    _bind_admin_handlers(admin_bot, int(owner_raw))
+    return asyncio.create_task(_run_admin_bot(admin_bot), name="admin_bot")
+
+
 async def run_account(account: AccountBot) -> None:
     """Полный жизненный цикл работы одного аккаунта."""
     try:
@@ -4645,12 +4809,17 @@ async def main() -> None:
         log.error("[QDRANT] Память недоступна, юзербот продолжит без RAG: %s", memory_exc, exc_info=True)
 
     account_bots = [AccountBot(name) for name in ACCOUNTS]
+    ACCOUNT_BOTS[:] = account_bots
 
     # Цикл, который с помощью asyncio.create_task() одновременно запускает метод start() и idle() для каждого аккаунта
     tasks: list[asyncio.Task] = []
     for account in account_bots:
         task = asyncio.create_task(run_account(account), name=f"account_{account.name}")
         tasks.append(task)
+
+    admin_task = launch_admin_bot()
+    if admin_task is not None:
+        tasks.append(admin_task)
 
     from pyrogram import idle
     try:
