@@ -1017,6 +1017,18 @@ else:
 
 UPDATE_MARKER_PREFIX: str = (os.getenv("UPDATE_MARKER_PREFIX") or "ОБНОВИТЬ_ДАННЫЕ:").strip()
 
+DATE_INITIATIVE_BAN = (
+    "ТЕБЕ ЗАПРЕЩЕНО САМОМУ ЗВАТЬ ГУЛЯТЬ, В КИНО, В КОФЕЙНЮ ИЛИ НА СВИДАНИЯ. "
+    "ТВОЯ ЦЕЛЬ — ВЕСТИ ДИАЛОГ ТАК, ЧТОБЫ ДЕВУШКА ПЕРВОЙ ПРЕДЛОЖИЛА ВСТРЕЧУ. "
+    "Веди себя пассивно-иронично"
+)
+
+LATIN_SCRIPT_BAN = (
+    "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ АНГЛИЙСКИЙ ЯЗЫК И ЛАТИНСКИЕ БУКВЫ "
+    "В ЛЮБЫХ СЛОВАХ ИЛИ НИКНЕЙМАХ. "
+    "ВСЕ СЛОВА ДОЛЖНЫ БЫТЬ НАПИСАНЫ ИСКЛЮЧИТЕЛЬНО КИРИЛЛИЦЕЙ НА ЖИВОМ РУССКОМ СЛЕНГЕ"
+)
+
 RUSSIAN_LANGUAGE_LOCK = (
     "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ КИТАЙСКИЕ ИЕРОГЛИФЫ ИЛИ АНГЛИЙСКИЙ ЯЗЫК. "
     "ТЫ ОБЩАЕШЬСЯ СТРОГО НА РУССКОМ ЯЗЫКЕ. "
@@ -1026,6 +1038,34 @@ RUSSIAN_LANGUAGE_LOCK = (
 )
 
 _HAN_RE = re.compile(r"[\u4e00-\u9fff]")
+_LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
+_TEXT_SMILEY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:[xX][dD]+|:[)DdPp]|:-[)DdPp])(?![A-Za-z0-9])"
+)
+_TECH_MARKER_RE = re.compile(
+    r"(?:"
+    r"(?i:обновить_данные)\s*:[^\n]*"
+    r"|"
+    r"\[[^\[\]\n]*(?:_|(?i:маркер|marker))[^\[\]\n]*\]"
+    r"|"
+    r"\[[A-ZА-ЯЁ][A-ZА-ЯЁ0-9_ ]{1,40}\]"
+    r"|"
+    r"(?<!\w)[A-Za-zА-Яа-яЁё]+_[A-Za-zА-Яа-яЁё0-9]+(?:_[A-Za-zА-Яа-яЁё0-9]+)*"
+    r")"
+)
+_DATE_ROOT_RE = re.compile(r"гуля|свидан|встрет|кофейн|кафе", re.IGNORECASE)
+_INVITE_CUE_RE = re.compile(
+    r"пошли|пойдём|пойдем|сходим|сходить|погнали|выбер|"
+    r"заскоч|заглян|айда|двинем|приглаш|"
+    r"давай|хочешь|погуля|гульн|встретимся|"
+    r"в\s+кафе|в\s+кофейн|на\s+свидан|в\s+кино",
+    re.IGNORECASE,
+)
+_PAST_MEET_RE = re.compile(
+    r"\b(вчера|был[аои]?|сидел[аи]?|ходил[аи]?|гулял[аи]?|встретил(?:ся|ась|ись)?)\b",
+    re.IGNORECASE,
+)
+_PROMPT_LOCKS = (DATE_INITIATIVE_BAN, LATIN_SCRIPT_BAN, RUSSIAN_LANGUAGE_LOCK)
 
 
 def _contains_han(text: str) -> bool:
@@ -1040,23 +1080,114 @@ def _strip_han(text: str) -> str:
     return cleaned.strip(" ,;:-")
 
 
-def _seal_russian_prompt(prompt: str) -> str:
-    """Ставит языковой замок в самое начало и в самый конец системного промпта."""
-    lock = RUSSIAN_LANGUAGE_LOCK
-    body = (prompt or "").strip()
+def _mask_text_smileys(text: str) -> tuple[str, list[str]]:
+    """Прячет :D / xd, чтобы проверка латиницы их не считала."""
+    found: list[str] = []
+
+    def repl(match: re.Match) -> str:
+        found.append(match.group(0))
+        return f"\uE000{len(found) - 1}\uE001"
+
+    return _TEXT_SMILEY_RE.sub(repl, text or ""), found
+
+
+def _contains_latin(text: str) -> bool:
+    """Латинские буквы в ответе, кроме текстовых смайлов :D и xd."""
+    masked, _ = _mask_text_smileys(text)
+    return bool(_LATIN_LETTER_RE.search(masked))
+
+
+def _strip_latin_letters(text: str) -> str:
+    """Вырезает латиницу и возвращает смайлы :D / xd на место."""
+    masked, smileys = _mask_text_smileys(text)
+    cleaned = _LATIN_LETTER_RE.sub("", masked)
+    for index, smiley in enumerate(smileys):
+        cleaned = cleaned.replace(f"\uE000{index}\uE001", smiley)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.strip(" ,;:-")
+
+
+def _strip_technical_markers(text: str) -> str:
+    """Убирает служебные маркеры из текста, который уйдёт в Telegram."""
+    cleaned = _TECH_MARKER_RE.sub(" ", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.strip(" ,;:-")
+
+
+def _extract_technical_markers(text: str) -> str:
+    """Собирает маркеры обратно, чтобы они остались в логе и Qdrant."""
+    found = [item.strip(" ,;") for item in _TECH_MARKER_RE.findall(text or "") if item.strip(" ,;")]
+    return " ".join(found).strip()
+
+
+def _archive_with_markers(visible: str, source: str) -> str:
+    """Текст для датасета: чистая реплика плюс служебные маркеры исходного ответа."""
+    markers = _extract_technical_markers(source)
+    body = (visible or "").strip()
+    if markers and markers not in body:
+        return f"{body} {markers}".strip() if body else markers
+    return body or (source or "").strip()
+
+
+def _proposes_meetup(text: str) -> bool:
+    """Корни свидания стоят в предложении куда-то пойти, а не в рассказе о прошлом."""
+    raw = (text or "").replace("ё", "е").replace("Ё", "Е")
+    if not _DATE_ROOT_RE.search(raw):
+        return False
+    for sentence in re.split(r"[.!?\n]+", raw):
+        sentence = sentence.strip()
+        if not sentence or not _DATE_ROOT_RE.search(sentence):
+            continue
+        if not _INVITE_CUE_RE.search(sentence):
+            continue
+        if _PAST_MEET_RE.search(sentence) and not re.search(
+            r"пошли|пойдем|пойдём|сходим|давай|хочешь|погуля|встретимся",
+            sentence,
+            re.IGNORECASE,
+        ):
+            continue
+        return True
+    return False
+
+
+def _drop_meetup_sentences(text: str) -> str:
+    """Убирает фразы, где Ваня сам зовёт на встречу."""
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text or "")
+    kept = [part.strip() for part in parts if part.strip() and not _proposes_meetup(part)]
+    return re.sub(r"\s+", " ", " ".join(kept)).strip()
+
+
+def _has_invite_marker(text: str) -> bool:
+    folded = (text or "").casefold()
+    if MARKER_INVITATION.casefold() in folded:
+        return True
+    return bool(re.search(r"маркер[_\s-]*приглашен", folded))
+
+
+def _strip_prompt_lock(body: str, lock: str) -> str:
+    body = (body or "").strip()
     while body.startswith(lock):
         body = body[len(lock):].strip()
     while body.endswith(lock):
         body = body[: -len(lock)].strip()
+    return body
+
+
+def _seal_russian_prompt(prompt: str) -> str:
+    """Запрет свиданий и латиницы стоит выше всего, языковой замок замыкает промпт."""
+    body = (prompt or "").strip()
+    for lock in _PROMPT_LOCKS:
+        body = _strip_prompt_lock(body, lock)
+    head = f"{DATE_INITIATIVE_BAN}\n\n{LATIN_SCRIPT_BAN}\n\n{RUSSIAN_LANGUAGE_LOCK}"
     if not body:
-        return f"{lock}\n\n{lock}"
-    return f"{lock}\n\n{body}\n\n{lock}"
+        return f"{head}\n\n{RUSSIAN_LANGUAGE_LOCK}"
+    return f"{head}\n\n{body}\n\n{RUSSIAN_LANGUAGE_LOCK}"
 
 
 DEFAULT_SYSTEM_PROMPT = f"""\
 {RUSSIAN_LANGUAGE_LOCK}
 
-Ты — 17-летний парень по имени Иван (Ваня). Твоя цель — вести живой, естественный и позитивный диалог с девушкой, с которой у тебя совпал лайк в Дайвинчике, общаться легко, непринужденно и плавно подводить к встрече.
+Ты — 17-летний парень по имени Иван (Ваня). Твоя цель — вести живой, естественный и позитивный диалог с девушкой, с которой у тебя совпал лайк в Дайвинчике, общаться легко и непринужденно. Сам не зови гулять, в кино, в кофейню или на свидание.
 
 ТВОЯ ЛИЧНОСТЬ (ИНФОРМАЦИЯ О СЕБЕ):
 - Тебе 17 лет, твой рост 175 см. У тебя отличное настроение, ты открыт к общению и уверен в себе.
@@ -2269,7 +2400,11 @@ class AccountBot:
             msg_role = str(msg.get("role", "user"))
             msg_content = msg.get("content")
             if msg_content and isinstance(msg_content, str) and msg_content.strip():
-                dialog_history.append({"role": msg_role, "content": msg_content.strip()})
+                content = msg_content.strip()
+                if msg_role == "assistant":
+                    content = _strip_latin_letters(_strip_technical_markers(content))
+                if content:
+                    dialog_history.append({"role": msg_role, "content": content})
 
         # Склеенная мысль уже лежит в логе отдельными репликами — убираем хвост, чтобы не дублировать её
         _collapse_trailing_user_burst(dialog_history, cleaned_user_text)
@@ -2338,19 +2473,43 @@ class AccountBot:
         reply: str,
         message: Message | None,
         user_text: str | None,
-    ) -> str:
+    ) -> tuple[str, str]:
         """
-        Перед отправкой в Telegram: если в ответе есть иероглиф, один раз
-        перегенерировать его с температурой на 0.1 ниже. Повторный сбой —
-        вырезать иероглифы и оставить русскую часть.
+        Перед отправкой ловит иероглифы, латиницу и самостоятельный зов на встречу.
+        Возвращает (текст для Telegram, текст для лога и Qdrant).
+        Маркеры остаются только во втором значении.
         """
-        if not _contains_han(reply):
-            return reply
+        def _pack(model_text: str) -> tuple[str, str]:
+            visible = _strip_technical_markers(model_text)
+            visible = _strip_han(visible)
+            if _contains_latin(visible):
+                visible = _strip_latin_letters(visible)
+            if _proposes_meetup(visible):
+                visible = _drop_meetup_sentences(visible)
+            visible = _strip_technical_markers(visible)
+            return visible.strip(), _archive_with_markers(visible, model_text)
 
-        reroll_temp = max(0.1, OLLAMA_TEMPERATURE - 0.1)
+        screened = _strip_technical_markers(reply)
+        han = _contains_han(screened)
+        latin = _contains_latin(screened)
+        meetup = _proposes_meetup(screened)
+        if not han and not latin and not meetup:
+            return screened, _archive_with_markers(screened, reply)
+
+        if latin or meetup:
+            reroll_temp = 0.3
+        else:
+            reroll_temp = max(0.1, OLLAMA_TEMPERATURE - 0.1)
+        reasons = []
+        if han:
+            reasons.append("иероглифы")
+        if latin:
+            reasons.append("латиница")
+        if meetup:
+            reasons.append("зов на встречу")
         log.warning(
-            "[%s][AI] В ответе для %s найдены иероглифы, повтор генерации с температурой %.2f",
-            self.name, chat_id, reroll_temp,
+            "[%s][AI] В ответе для %s найдено: %s. Повтор генерации с температурой %.2f",
+            self.name, chat_id, ", ".join(reasons), reroll_temp,
         )
         source = (user_text or "").strip()
         if not source and message is not None:
@@ -2360,22 +2519,22 @@ class AccountBot:
         if source:
             rerolled = await self.ask_ai(chat_id, source, message=message, temperature=reroll_temp)
             rerolled = re.sub(r"<think>[\s\S]*?</think>", "", rerolled or "").strip()
-            rerolled = rerolled.replace(MARKER_INVITATION, "").replace(INVITE_MARKER, "").strip()
-            update_match = re.search(r"ОБНОВИТЬ_ДАННЫЕ:\s*([^\n]+)", rerolled)
+            update_match = re.search(r"(?i:обновить_данные)\s*:\s*([^\n]+)", rerolled)
             if update_match:
                 await self._handle_update_marker(chat_id, update_match.group(1).strip())
-                rerolled = rerolled.replace(update_match.group(0), "").strip()
 
-        if rerolled and not _contains_han(rerolled):
-            log.info("[%s][AI] Повторная генерация для %s пришла на русском", self.name, chat_id)
-            return rerolled
+        reroll_screened = _strip_technical_markers(rerolled)
+        if reroll_screened and not _contains_han(reroll_screened) and not _contains_latin(reroll_screened) and not _proposes_meetup(reroll_screened):
+            log.info("[%s][AI] Повторная генерация для %s прошла проверку", self.name, chat_id)
+            return reroll_screened, _archive_with_markers(reroll_screened, rerolled)
 
-        cleaned = _strip_han(rerolled) or _strip_han(reply)
+        fallback_source = rerolled or reply
+        visible, archived = _pack(fallback_source)
         log.warning(
-            "[%s][AI] Повторный сбой языка для %s, иероглифы вырезаны: '%s'",
-            self.name, chat_id, cleaned[:60],
+            "[%s][AI] Повторный сбой проверки для %s, опасные куски вырезаны: '%s'",
+            self.name, chat_id, visible[:60],
         )
-        return cleaned
+        return visible, archived
 
     async def _remember_successful_reply(
         self,
@@ -2439,7 +2598,6 @@ class AccountBot:
                         self.name, index + 1, reply_to_msg_id, send_err,
                     )
                     await self.client.send_message(chat_id, chunk)
-                self._append_to_history(chat_id, "assistant", chunk)
                 self._update_chat_state(chat_id, is_me=True)
                 if index < len(chunks) - 1:
                     try:
@@ -2489,14 +2647,12 @@ class AccountBot:
                 if clean_reply:
                     reply = clean_reply[0].upper() + clean_reply[1:]
 
-        has_invite = (MARKER_INVITATION in reply) or (INVITE_MARKER in reply)
-        reply = reply.replace(MARKER_INVITATION, "").replace(INVITE_MARKER, "").strip()
+        has_invite = _has_invite_marker(reply)
 
-        update_match = re.search(r"ОБНОВИТЬ_ДАННЫЕ:\s*([^\n]+)", reply)
+        update_match = re.search(r"(?i:обновить_данные)\s*:\s*([^\n]+)", reply)
         if update_match:
             log.info("[%s][PROCESS_REPLY] Найден маркер обновления данных для чата %s", self.name, chat_id)
             await self._handle_update_marker(chat_id, update_match.group(1).strip())
-            reply = reply.replace(update_match.group(0), "").strip()
 
         # Определяем, нужно ли визуально линковать ответ через reply_to_message_id.
         # Бот отвечает обычным текстом, если девушка написала простое сообщение.
@@ -2528,7 +2684,8 @@ class AccountBot:
             except Exception as send_err:
                 log.warning("[%s][PROCESS_REPLY] Ошибка отправки с reply_to_message_id (%s), пробуем обычный send_message: %s", self.name, reply_to_msg_id, send_err)
                 await self.client.send_message(chat_id, invite_text)
-            self._append_to_history(chat_id, "assistant", invite_text)
+            archived_invite = _archive_with_markers(invite_text, reply)
+            self._append_to_history(chat_id, "assistant", archived_invite)
             self._update_chat_state(chat_id, is_me=True)
 
             chat_data = self.active_chats.get(chat_id, {})
@@ -2546,10 +2703,10 @@ class AccountBot:
                 f"🔔 [{self.name}] Запись внесена в Excel. Клиент: {name} ({username})",
             )
             log.info("[%s][PROCESS_REPLY] Приглашение успешно зафиксировано для %s (%s)", self.name, name, username)
-            await self._remember_successful_reply(chat_id, message, invite_text, user_text=user_text)
+            await self._remember_successful_reply(chat_id, message, archived_invite, user_text=user_text)
             return
 
-        reply = await self._guard_russian_reply(chat_id, reply, message, user_text)
+        reply, archived_reply = await self._guard_russian_reply(chat_id, reply, message, user_text)
 
         if reply:
             chunks = split_reply_chunks(reply)
@@ -2576,16 +2733,16 @@ class AccountBot:
                     except Exception as send_err:
                         log.warning("[%s][PROCESS_REPLY] Ошибка отправки с reply_to_message_id (%s), пробуем обычный send_message: %s", self.name, reply_to_msg_id, send_err)
                         await self.client.send_message(chat_id, text)
-                    self._append_to_history(chat_id, "assistant", text)
                     self._update_chat_state(chat_id, is_me=True)
             except asyncio.CancelledError:
                 log.info("[%s][PROCESS_REPLY] Отправка порций клиенту %s прервана новым сообщением", self.name, chat_id)
                 raise
+            self._append_to_history(chat_id, "assistant", archived_reply)
             log.info(
                 "[%s][PROCESS_REPLY] Ответ успешно отправлен клиенту %s (%d сообщ.): '%s'",
                 self.name, chat_id, len(chunks), reply[:60].replace("\n", " ")
             )
-            await self._remember_successful_reply(chat_id, message, reply, user_text=user_text)
+            await self._remember_successful_reply(chat_id, message, archived_reply, user_text=user_text)
 
     # ── Логика задержки, прочтения истории и набора текста ───────────────────
 
