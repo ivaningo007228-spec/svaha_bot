@@ -438,6 +438,34 @@ def _ollama_message_text(response: object) -> str:
         content = getattr(message, "content", "") or ""
     return str(content).replace("\n", " ").strip()
 
+
+PHOTO_VISION_LOOP_TEXT: str = "[Девушка прислала фото/мем]"
+# Короткое описание — одно-два предложения. Длиннее уже похоже на зацикленный ответ.
+_MOONDREAM_MAX_CHARS: int = 350
+
+
+def _moondream_reply_is_loop(text: str) -> bool:
+    """Одно слово подряд больше трёх раз, повтор фразы или слишком длинный ответ."""
+    if len(text) > _MOONDREAM_MAX_CHARS:
+        return True
+    words = re.findall(r"\w+", text.casefold())
+    run = 1
+    for previous, word in zip(words, words[1:]):
+        if word == previous:
+            run += 1
+            if run > 3:
+                return True
+        else:
+            run = 1
+    for size in range(3, 6):
+        if len(words) < size * 2:
+            continue
+        for start in range(len(words) - size * 2 + 1):
+            phrase = words[start:start + size]
+            if words[start + size:start + size * 2] == phrase:
+                return True
+    return False
+
 # Склейка мыслей собеседника: общие словари модуля
 pending_messages: dict[int, list[str]] = {}
 debouncer_tasks: dict[int, asyncio.Task] = {}
@@ -3888,10 +3916,21 @@ class AccountBot:
                     "content": MOONDREAM_PROMPT,
                     "images": [img_base64],
                 }],
+                options={
+                    "temperature": 0.1,
+                    "repeat_penalty": 1.2,
+                    "num_predict": 100,
+                },
             )
             description = _ollama_message_text(response)
             log.info("[%s][PHOTO] moondream вернула описание (%d симв.)", self.name, len(description or ""))
             log.info('[VISION_DEBUG] Текст от moondream: "%s"', description or "")
+            if description and _moondream_reply_is_loop(description):
+                log.warning(
+                    "[%s][PHOTO] moondream зациклилась или ответила слишком длинно, подставляем безопасное описание",
+                    self.name,
+                )
+                description = PHOTO_VISION_LOOP_TEXT
             return description or None
         except asyncio.CancelledError:
             raise
