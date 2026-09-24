@@ -3866,8 +3866,9 @@ class AccountBot:
                     "images": [photo_path],
                 }],
             )
-            log.info("[%s][PHOTO] moondream вернула описание (%d симв.)", self.name, len(_ollama_message_text(response) or ""))
             description = _ollama_message_text(response)
+            log.info("[%s][PHOTO] moondream вернула описание (%d симв.)", self.name, len(description or ""))
+            log.info('[VISION_DEBUG] Текст от moondream: "%s"', description or "")
             return description or None
         except asyncio.CancelledError:
             raise
