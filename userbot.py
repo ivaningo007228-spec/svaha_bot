@@ -435,7 +435,7 @@ pending_messages: dict[int, list[str]] = {}
 debouncer_tasks: dict[int, asyncio.Task] = {}
 
 # ── Векторная память диалогов (Qdrant + MiniLM на CPU) ─────────────────────
-QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_HOST: str = os.getenv("QDRANT_HOST", "127.0.0.1")
 QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
 EMBEDDING_MODEL_NAME: str = os.getenv(
     "EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
@@ -472,7 +472,7 @@ def _embed_text_sync(text: str) -> list[float]:
 async def init_vector_memory() -> None:
     """
     Один раз при старте юзербота:
-    - поднимает AsyncQdrantClient к localhost:6333;
+    - поднимает AsyncQdrantClient к QDRANT_HOST:QDRANT_PORT (по умолчанию 127.0.0.1:6333);
     - создаёт коллекцию vanya_memories (384, Cosine), если её ещё нет;
     - грузит SentenceTransformer all-MiniLM-L6-v2 строго на CPU.
     """
@@ -489,7 +489,13 @@ async def init_vector_memory() -> None:
             "[QDRANT] Подключение к %s:%s, коллекция '%s'...",
             QDRANT_HOST, QDRANT_PORT, QDRANT_COLLECTION,
         )
-        qdrant_client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30.0)
+        # trust_env=False: локальный Qdrant не должен идти через HTTP_PROXY Windows.
+        qdrant_client = AsyncQdrantClient(
+            host=QDRANT_HOST,
+            port=QDRANT_PORT,
+            timeout=30.0,
+            trust_env=False,
+        )
 
         if not await qdrant_client.collection_exists(QDRANT_COLLECTION):
             await qdrant_client.create_collection(
