@@ -414,6 +414,13 @@ Client.handle_updates = _patched_handle_updates
 # ── Настройки ИИ (локальная Ollama, без загрузки весов в процесс бота) ──────
 OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "vanya_q5")
+MOONDREAM_MODEL: str = os.getenv("MOONDREAM_MODEL", "moondream")
+MOONDREAM_PROMPT: str = (
+    "Что изображено на этой картинке? Если на ней есть текст, мемы или надписи "
+    "на русском или английском языке, дословно напиши их содержание. "
+    "Ответь очень кратко, в одном-двух предложениях на русском языке"
+)
+PHOTO_VISION_FALLBACK: str = "ппц у меня тут инет лагает, картинка не прогрузилась, че там?"
 # Штраф выше ~1.1 заставляет Qwen бросать кириллицу и срываться в иероглифы.
 OLLAMA_TEMPERATURE: float = 0.45
 OLLAMA_REPEAT_PENALTY: float = 1.08
@@ -1662,7 +1669,23 @@ class AccountBot:
         async def _on_leobot(client: Client, message: Message):
             await self.on_leobot_message(message)
 
-        @self.client.on_message(filters.private & ~filters.bot & ~filters.service, group=4)
+        @self.client.on_message(
+            filters.private
+            & ~filters.bot
+            & ~filters.service
+            & (
+                filters.text
+                | filters.photo
+                | filters.video
+                | filters.animation
+                | filters.voice
+                | filters.video_note
+                | filters.sticker
+                | filters.audio
+                | filters.document
+            ),
+            group=4,
+        )
         async def _on_girl(client: Client, message: Message):
             await self.handle_girl_message(message)
 
@@ -3819,6 +3842,92 @@ class AccountBot:
                     name=f"typing_cancel_{self.name}_{chat_id}",
                 )
 
+    async def _describe_photo(self, message: Message) -> str | None:
+        """Скачивает фото, спрашивает moondream и удаляет временный файл."""
+        photo_path: str | None = None
+        client: AsyncClient | None = None
+        try:
+            photo_path = await message.download()
+            if not photo_path:
+                log.warning("[%s][PHOTO] Не удалось скачать фото из чата %s", self.name, message.chat.id)
+                return None
+            # trust_env=False: httpx 0.28 не принимает proxies={}, иначе локальная Ollama уйдёт в системный прокси.
+            client = AsyncClient(
+                host=os.getenv("OLLAMA_HOST", OLLAMA_HOST),
+                timeout=60.0,
+                trust_env=False,
+            )
+            log.info("[%s][PHOTO] Запрос описания в moondream", self.name)
+            response = await client.chat(
+                model=MOONDREAM_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": MOONDREAM_PROMPT,
+                    "images": [photo_path],
+                }],
+            )
+            log.info("[%s][PHOTO] moondream вернула описание (%d симв.)", self.name, len(_ollama_message_text(response) or ""))
+            description = _ollama_message_text(response)
+            return description or None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("[%s][PHOTO] moondream не разобрала фото: %s", self.name, exc)
+            return None
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    log.debug("[%s][PHOTO] Клиент moondream уже закрыт", self.name)
+            if photo_path and os.path.exists(photo_path):
+                try:
+                    os.remove(photo_path)
+                except OSError as exc:
+                    log.debug("[%s][PHOTO] Не удалось удалить %s: %s", self.name, photo_path, exc)
+
+    async def _enqueue_photo_thought(self, message: Message, chat_id: int, chat_info: dict) -> None:
+        """Описание фото уходит в обычный пайплайн ask_ai как реплика девушки."""
+        caption = (message.caption or "").strip()
+        log.info("[%s][PHOTO] Чат %d: скачиваем фото и спрашиваем moondream", self.name, chat_id)
+        description = await self._describe_photo(message)
+
+        chat_data = self.active_chats.get(chat_id) or chat_info
+        if not isinstance(chat_data, dict):
+            return
+        self.active_chats[chat_id] = chat_data
+        chat_data["last_msg_time"] = asyncio.get_event_loop().time()
+        chat_data["pinged"] = False
+
+        if not description:
+            history_entry = f"[Фото] {caption}".strip() if caption else "[Фото]"
+            self._append_to_history(chat_id, "user", history_entry)
+            chat_data["last_msg_is_me"] = False
+            log.info("[%s][PHOTO] Чат %d: moondream недоступна, отвечаем отмазкой", self.name, chat_id)
+            await self.process_ai_reply(
+                chat_id,
+                PHOTO_VISION_FALLBACK,
+                message=message,
+                user_text=history_entry,
+            )
+            return
+
+        if caption:
+            msg_text = (
+                f'[Девушка прислала фото с подписью "{caption}". '
+                f"Описание изображения: {description}]"
+            )
+        else:
+            msg_text = f"[Девушка прислала тебе фото. Описание изображения: {description}]"
+
+        log.info("[%s][PHOTO] Чат %d: описание готово, отдаём в ask_ai", self.name, chat_id)
+        self._append_to_history(chat_id, "user", msg_text)
+        chat_data["last_msg_is_me"] = False
+        prev_reply_task: asyncio.Task | None = chat_data.get("reply_task")
+        if prev_reply_task and not prev_reply_task.done():
+            prev_reply_task.cancel()
+        self._queue_debounced_thought(chat_id, message, msg_text)
+
     async def handle_girl_message(self, message: Message) -> None:
         """Перехват входящих сообщений (текстовых и медиа) от девушек / клиентов."""
         chat_id = message.chat.id
@@ -3907,6 +4016,10 @@ class AccountBot:
 
         raw_caption = (message.caption or "").strip()
         msg_text = (message.text or raw_caption).strip()
+
+        if message.photo:
+            await self._enqueue_photo_thought(message, chat_id, chat_info)
+            return
 
         if is_media:
             media_type_name = "фото" if message.photo else \
