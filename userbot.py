@@ -2487,12 +2487,16 @@ class AccountBot:
             self.name, len(messages), len(messages) - 1, messages[-1]["role"], messages[-1]["content"][:60]
         )
 
-        # 4. Асинхронный запрос в Ollama. Event loop Pyrogram в это время свободен.
+        # 4. Асинхронный запрос в Ollama. await client.chat не блокирует event loop:
+        # AsyncClient ходит в HTTP через httpx, печать и Pyrogram в это время живут отдельно.
         client = AsyncClient(host=os.getenv("OLLAMA_HOST", OLLAMA_HOST))
+        model_name = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
         try:
-            log.info("[%s][AI] Запрос в Ollama, модель %s", self.name, os.getenv("OLLAMA_MODEL", OLLAMA_MODEL))
+            print(f"[DEBUG] Запрос в Ollama, модель {model_name}", flush=True)
+            log.info("[%s][AI] Запрос в Ollama, модель %s", self.name, model_name)
+            ollama_started = time.perf_counter()
             response = await client.chat(
-                model=os.getenv("OLLAMA_MODEL", OLLAMA_MODEL),
+                model=model_name,
                 messages=messages,
                 options={
                     "temperature": temperature,
@@ -2502,6 +2506,9 @@ class AccountBot:
                     "num_predict": 96,
                 },
             )
+            ollama_elapsed = time.perf_counter() - ollama_started
+            print(f"[DEBUG] Ответ от Ollama получен за {ollama_elapsed:.2f} секунд", flush=True)
+            log.info("[%s][DEBUG] Ответ от Ollama получен за %.2f секунд", self.name, ollama_elapsed)
             ai_text = _ollama_message_text(response)
             log.info(
                 "[%s][AI] Успешный ответ от Ollama для %s (длина: %d симв.): '%s'",
@@ -2513,11 +2520,11 @@ class AccountBot:
             raise
         except Exception as e:
             log.error("[%s] Критическая ошибка запроса в Ollama: %s", self.name, e, exc_info=True)
-            print(f"[{self.name}][DEBUG ИИ] Критическая ошибка генерации: {e}")
+            print(f"[{self.name}][DEBUG ИИ] Критическая ошибка генерации: {e}", flush=True)
             return ""
         finally:
             try:
-                await client.close()
+                await asyncio.wait_for(client.close(), timeout=5.0)
             except Exception:
                 log.debug("[%s][AI] Клиент Ollama уже закрыт", self.name)
 
@@ -2896,16 +2903,28 @@ class AccountBot:
 
             # Шаг 3. Запускаем фоновую задачу циклического обновления статуса TYPING каждые 4 секунды
             async def _keep_typing():
-                while not typing_stop_event.is_set():
-                    try:
-                        await asyncio.wait_for(typing_stop_event.wait(), timeout=4.0)
-                    except asyncio.TimeoutError:
-                        pass
-                    if not typing_stop_event.is_set():
+                try:
+                    while not typing_stop_event.is_set():
                         try:
-                            await self.client.send_chat_action(chat_id, enums.ChatAction.TYPING)
+                            await asyncio.wait_for(typing_stop_event.wait(), timeout=4.0)
+                        except asyncio.TimeoutError:
+                            pass
+                        except asyncio.CancelledError:
+                            raise
+                        if typing_stop_event.is_set():
+                            break
+                        try:
+                            await asyncio.wait_for(
+                                self.client.send_chat_action(chat_id, enums.ChatAction.TYPING),
+                                timeout=5.0,
+                            )
+                        except asyncio.CancelledError:
+                            raise
                         except Exception as exc:
                             log.debug("[%s][REPLY_WORKER] Ошибка send_chat_action TYPING в %d: %s", self.name, chat_id, exc)
+                except asyncio.CancelledError:
+                    log.debug("[%s][REPLY_WORKER] Чат %d: цикл печати отменён", self.name, chat_id)
+                    raise
 
             typing_task = asyncio.create_task(_keep_typing())
 
@@ -3556,15 +3575,24 @@ class AccountBot:
         try:
             while stop is not None and not stop.is_set():
                 try:
-                    await self.client.send_chat_action(chat_id, enums.ChatAction.TYPING)
+                    await asyncio.wait_for(
+                        self.client.send_chat_action(chat_id, enums.ChatAction.TYPING),
+                        timeout=5.0,
+                    )
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    log.debug("[%s][DEBOUNCE] Чат %d: TYPING не подтвердился за 5 с", self.name, chat_id)
                 except Exception as exc:
                     log.debug("[%s][DEBOUNCE] Не удалось показать TYPING в чате %d: %s", self.name, chat_id, exc)
+                if stop.is_set():
+                    break
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=4.0)
                 except asyncio.TimeoutError:
-                    pass
+                    continue
+                except asyncio.CancelledError:
+                    raise
         except asyncio.CancelledError:
             log.debug("[%s][DEBOUNCE] Чат %d: цикл печати Вани отменён", self.name, chat_id)
             raise
@@ -3683,6 +3711,7 @@ class AccountBot:
         Отмена не удаляет накопленный текст и не роняет юзербота.
         """
         current = asyncio.current_task()
+        generate_task: asyncio.Task | None = None
         try:
             ready = self._listen_ready.get(chat_id)
             if ready is not None and not ready.is_set():
@@ -3782,6 +3811,17 @@ class AccountBot:
                 self.name, chat_id,
             )
             raise
+        finally:
+            if generate_task is not None and not generate_task.done():
+                generate_task.cancel()
+            if self._generate_tasks.get(chat_id) is generate_task:
+                self._generate_tasks.pop(chat_id, None)
+            if chat_id in self._typing_tasks or chat_id in self._typing_stop:
+                self._stop_typing(chat_id)
+                asyncio.create_task(
+                    self._send_typing_cancel(chat_id),
+                    name=f"typing_cancel_{self.name}_{chat_id}",
+                )
 
     async def handle_girl_message(self, message: Message) -> None:
         """Перехват входящих сообщений (текстовых и медиа) от девушек / клиентов."""
