@@ -6,7 +6,6 @@ Pyrogram + локальная Ollama (vanya_q5) + openpyxl + Умный авто
 """
 
 import asyncio
-import base64
 from datetime import datetime, time as dtime, timedelta
 import hashlib
 import json
@@ -18,6 +17,7 @@ import re
 import sys
 import time
 import uuid
+from faster_whisper import WhisperModel
 from ollama import AsyncClient
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qmodels
@@ -415,13 +415,7 @@ Client.handle_updates = _patched_handle_updates
 # ── Настройки ИИ (локальная Ollama, без загрузки весов в процесс бота) ──────
 OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "vanya_q5")
-MOONDREAM_MODEL: str = os.getenv("MOONDREAM_MODEL", "moondream")
-MOONDREAM_PROMPT: str = (
-    "Опиши подробно и понятно, что изображено на этой фотографии? "
-    "Если это мем с текстом, дословно перепиши весь текст на русском. "
-    "Ответь кратко на русском языке."
-)
-PHOTO_VISION_FALLBACK: str = "ппц у меня тут инет лагает, картинка не прогрузилась, че там?"
+VOICE_LISTEN_FALLBACK: str = "блин, я ща в шумном месте, не могу гс послушать, черкани текстом плиз"
 # Штраф выше ~1.1 заставляет Qwen бросать кириллицу и срываться в иероглифы.
 OLLAMA_TEMPERATURE: float = 0.45
 OLLAMA_REPEAT_PENALTY: float = 1.08
@@ -439,32 +433,36 @@ def _ollama_message_text(response: object) -> str:
     return str(content).replace("\n", " ").strip()
 
 
-PHOTO_VISION_LOOP_TEXT: str = "[Девушка прислала фото/мем]"
-# Короткое описание — одно-два предложения. Длиннее уже похоже на зацикленный ответ.
-_MOONDREAM_MAX_CHARS: int = 350
+whisper_model: WhisperModel | None = None
+_whisper_on_cuda: bool = False
 
 
-def _moondream_reply_is_loop(text: str) -> bool:
-    """Одно слово подряд больше трёх раз, повтор фразы или слишком длинный ответ."""
-    if len(text) > _MOONDREAM_MAX_CHARS:
-        return True
-    words = re.findall(r"\w+", text.casefold())
-    run = 1
-    for previous, word in zip(words, words[1:]):
-        if word == previous:
-            run += 1
-            if run > 3:
-                return True
-        else:
-            run = 1
-    for size in range(3, 6):
-        if len(words) < size * 2:
-            continue
-        for start in range(len(words) - size * 2 + 1):
-            phrase = words[start:start + size]
-            if words[start + size:start + size * 2] == phrase:
-                return True
-    return False
+def init_whisper() -> None:
+    """Один раз при старте: medium на CUDA, при сбое драйвера — small на CPU."""
+    global whisper_model, _whisper_on_cuda
+    try:
+        log.info("Загрузка Faster-Whisper medium на CUDA (float16)...")
+        whisper_model = WhisperModel("medium", device="cuda", compute_type="float16")
+        _whisper_on_cuda = True
+        log.info("Whisper medium готов на CUDA")
+    except Exception as exc:
+        log.warning("CUDA для Whisper недоступна (%s). Откат на CPU: small/int8", exc)
+        try:
+            whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+            _whisper_on_cuda = False
+            log.info("Whisper small готов на CPU")
+        except Exception as cpu_exc:
+            whisper_model = None
+            _whisper_on_cuda = False
+            log.error("Whisper не загрузился, голосовые пойдут отмазкой: %s", cpu_exc)
+
+
+def _transcribe_voice_file(path: str) -> str:
+    """Синхронная расшифровка. Генератор сегментов крутится здесь, не в event loop."""
+    if whisper_model is None:
+        return ""
+    segments, _info = whisper_model.transcribe(path, language="ru")
+    return " ".join([segment.text for segment in segments]).strip()
 
 # Склейка мыслей собеседника: общие словари модуля
 pending_messages: dict[int, list[str]] = {}
@@ -1704,10 +1702,10 @@ class AccountBot:
             & ~filters.service
             & (
                 filters.text
+                | filters.voice
                 | filters.photo
                 | filters.video
                 | filters.animation
-                | filters.voice
                 | filters.video_note
                 | filters.sticker
                 | filters.audio
@@ -3871,89 +3869,39 @@ class AccountBot:
                     name=f"typing_cancel_{self.name}_{chat_id}",
                 )
 
-    async def _describe_photo(self, message: Message) -> str | None:
-        """Скачивает фото, спрашивает moondream и удаляет временный файл."""
-        photo_path: str | None = None
-        client: AsyncClient | None = None
+    async def _transcribe_voice(self, message: Message) -> str | None:
+        """Скачивает голосовое, расшифровывает Whisper и удаляет временный файл."""
+        voice_path: str | None = None
         try:
-            target = BASE_DIR / "downloads" / f"photo_{message.chat.id}_{message.id}.jpg"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                target.unlink()
-            downloaded = await message.download(file_name=str(target))
-            photo_file = Path(downloaded).resolve() if downloaded else None
-            photo_path = str(photo_file) if photo_file is not None else None
-            if photo_file is None or not photo_file.is_file() or photo_file.stat().st_size <= 0:
-                log.warning(
-                    "[%s][PHOTO] Скачанный файл не найден или пустой: %r",
-                    self.name,
-                    downloaded,
-                )
+            if whisper_model is None:
+                log.warning("[%s][VOICE] Whisper не загружен", self.name)
                 return None
-            log.info(
-                "[%s][PHOTO] Фото на диске: %s (%d байт)",
-                self.name,
-                photo_path,
-                photo_file.stat().st_size,
-            )
-            # trust_env=False: httpx 0.28 не принимает proxies={}, иначе локальная Ollama уйдёт в системный прокси.
-            client = AsyncClient(
-                host=os.getenv("OLLAMA_HOST", OLLAMA_HOST),
-                timeout=60.0,
-                trust_env=False,
-            )
-            with open(photo_path, "rb") as image_file:
-                img_base64 = base64.b64encode(image_file.read()).decode("utf-8")
-            log.info(
-                "[%s][PHOTO] Запрос описания в moondream, картинка в base64 (%d симв.)",
-                self.name,
-                len(img_base64),
-            )
-            response = await client.chat(
-                model=MOONDREAM_MODEL,
-                messages=[{
-                    "role": "user",
-                    "content": MOONDREAM_PROMPT,
-                    "images": [img_base64],
-                }],
-                options={
-                    "temperature": 0.1,
-                    "repeat_penalty": 1.2,
-                    "num_predict": 100,
-                },
-            )
-            description = _ollama_message_text(response)
-            log.info("[%s][PHOTO] moondream вернула описание (%d симв.)", self.name, len(description or ""))
-            log.info('[VISION_DEBUG] Текст от moondream: "%s"', description or "")
-            if description and _moondream_reply_is_loop(description):
-                log.warning(
-                    "[%s][PHOTO] moondream зациклилась или ответила слишком длинно, подставляем безопасное описание",
-                    self.name,
-                )
-                description = PHOTO_VISION_LOOP_TEXT
-            return description or None
+            voice_path = await message.download()
+            if not voice_path or not os.path.isfile(voice_path):
+                log.warning("[%s][VOICE] Не удалось скачать голосовое из чата %s", self.name, message.chat.id)
+                return None
+            text = await asyncio.to_thread(_transcribe_voice_file, voice_path)
+            if _whisper_on_cuda:
+                logger.info(f"[VOICE_DEBUG] Расшифровано через Whisper-medium (CUDA): '{text}'")
+            else:
+                logger.info(f"[VOICE_DEBUG] Расшифровано через Whisper-small (CPU): '{text}'")
+            return text or None
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("[%s][PHOTO] moondream не разобрала фото: %s", self.name, exc)
+            log.warning("[%s][VOICE] Whisper не разобрал голосовое: %s", self.name, exc)
             return None
         finally:
-            if client is not None:
+            if voice_path and os.path.exists(voice_path):
                 try:
-                    await client.close()
-                except Exception:
-                    log.debug("[%s][PHOTO] Клиент moondream уже закрыт", self.name)
-            if photo_path and os.path.exists(photo_path):
-                try:
-                    os.remove(photo_path)
+                    os.remove(voice_path)
                 except OSError as exc:
-                    log.debug("[%s][PHOTO] Не удалось удалить %s: %s", self.name, photo_path, exc)
+                    log.debug("[%s][VOICE] Не удалось удалить %s: %s", self.name, voice_path, exc)
 
-    async def _enqueue_photo_thought(self, message: Message, chat_id: int, chat_info: dict) -> None:
-        """Описание фото уходит в обычный пайплайн ask_ai как реплика девушки."""
-        caption = (message.caption or "").strip()
-        log.info("[%s][PHOTO] Чат %d: скачиваем фото и спрашиваем moondream", self.name, chat_id)
-        description = await self._describe_photo(message)
+    async def _enqueue_voice_thought(self, message: Message, chat_id: int, chat_info: dict) -> None:
+        """Расшифровка голосового уходит в обычный пайплайн ask_ai как реплика девушки."""
+        log.info("[%s][VOICE] Чат %d: скачиваем голосовое и спрашиваем Whisper", self.name, chat_id)
+        text = await self._transcribe_voice(message)
 
         chat_data = self.active_chats.get(chat_id) or chat_info
         if not isinstance(chat_data, dict):
@@ -3962,28 +3910,21 @@ class AccountBot:
         chat_data["last_msg_time"] = asyncio.get_event_loop().time()
         chat_data["pinged"] = False
 
-        if not description:
-            history_entry = f"[Фото] {caption}".strip() if caption else "[Фото]"
+        if not text:
+            history_entry = "[Голосовое]"
             self._append_to_history(chat_id, "user", history_entry)
             chat_data["last_msg_is_me"] = False
-            log.info("[%s][PHOTO] Чат %d: moondream недоступна, отвечаем отмазкой", self.name, chat_id)
+            log.info("[%s][VOICE] Чат %d: расшифровка пустая, отвечаем отмазкой", self.name, chat_id)
             await self.process_ai_reply(
                 chat_id,
-                PHOTO_VISION_FALLBACK,
+                VOICE_LISTEN_FALLBACK,
                 message=message,
                 user_text=history_entry,
             )
             return
 
-        if caption:
-            msg_text = (
-                f'[Девушка прислала фото с подписью "{caption}". '
-                f"Описание изображения: {description}]"
-            )
-        else:
-            msg_text = f"[Девушка прислала тебе фото. Описание изображения: {description}]"
-
-        log.info("[%s][PHOTO] Чат %d: описание готово, отдаём в ask_ai", self.name, chat_id)
+        msg_text = f"[Девушка прислала тебе голосовое сообщение: {text}]"
+        log.info("[%s][VOICE] Чат %d: расшифровка готова, отдаём в ask_ai", self.name, chat_id)
         self._append_to_history(chat_id, "user", msg_text)
         chat_data["last_msg_is_me"] = False
         prev_reply_task: asyncio.Task | None = chat_data.get("reply_task")
@@ -4080,8 +4021,8 @@ class AccountBot:
         raw_caption = (message.caption or "").strip()
         msg_text = (message.text or raw_caption).strip()
 
-        if message.photo:
-            await self._enqueue_photo_thought(message, chat_id, chat_info)
+        if message.voice:
+            await self._enqueue_voice_thought(message, chat_id, chat_info)
             return
 
         if is_media:
@@ -4684,6 +4625,7 @@ async def main() -> None:
     DATABASES_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_CHATS_DIR.mkdir(parents=True, exist_ok=True)
 
+    init_whisper()
     log.info("Запуск системы мультиаккаунтности. Список аккаунтов: %s", ACCOUNTS)
     log.info("Telegram API: API_ID=%s (загружен из .env)", API_ID)
     log.info(
